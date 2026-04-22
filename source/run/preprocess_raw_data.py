@@ -20,6 +20,24 @@ import os
 import random
 from typing import Dict, List, Any, Tuple, Literal, Optional, Generator
 
+
+def resolve_hotpotqa_corpus_glob() -> str:
+    candidate_dirs = [
+        os.path.join("data", "raw_data", "hotpotqa", "wikipedia-paragraphs"),
+        os.path.join("data", "raw_data", "hotpotqa", "wikpedia-paragraphs"),
+    ]
+
+    for corpus_dir in candidate_dirs:
+        raw_glob_filepath = os.path.join(corpus_dir, "*", "wiki_*.bz2")
+        if glob.glob(raw_glob_filepath):
+            return raw_glob_filepath
+
+    checked_dirs = ", ".join(candidate_dirs)
+    raise FileNotFoundError(
+        "HotpotQA Wikipedia corpus not found. "
+        f"Expected wiki_*.bz2 files under one of: {checked_dirs}"
+    )
+
 def hash_object(o: Any) -> str:
     """Returns a character hash code of arbitrary Python objects."""
     m = hashlib.blake2b()
@@ -33,9 +51,10 @@ def make_hotpotqa_documents_tsv(
     output_filepath: str,
     metadata: Dict = None
 ) -> None:
-    raw_glob_filepath = os.path.join("data", "raw_data", "hotpotqa", "wikipedia-paragraphs", "*", "wiki_*.bz2")
+    raw_glob_filepath = resolve_hotpotqa_corpus_glob()
     metadata = metadata or {"idx": 1}
     assert "idx" in metadata
+    num_passages = 0
 
     with open(output_filepath, "w", encoding="utf-8") as tsv_file:
         # Write headers to the TSV file
@@ -58,6 +77,13 @@ def make_hotpotqa_documents_tsv(
                 title = title.replace('\n', ' ').strip()
                 tsv_file.write(f"{id_}\t{paragraph_text}\t{title}\n")
                 metadata["idx"] += 1
+                num_passages += 1
+
+    if num_passages == 0:
+        raise ValueError(
+            "HotpotQA preprocessing produced zero passages. "
+            f"Resolved corpus glob: {raw_glob_filepath}"
+        )
 
 
 def make_iirc_documents_tsv(

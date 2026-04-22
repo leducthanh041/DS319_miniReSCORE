@@ -43,8 +43,10 @@ def main(args):
     cfg = DenseRetrieverConfig(
         batch_size=args.per_gpu_batch_size,
         training_strategy='query_only',
-        use_fp16=True,
-        query_model_name_or_path='facebook/contriever-msmarco',
+        use_fp16=not args.no_fp16,
+        query_model_name_or_path=args.model_name_or_path,
+        passage_model_name_or_path=args.model_name_or_path,
+        max_length=args.passage_maxlength,
     )
     
     retriever = DenseRetriever(
@@ -65,6 +67,11 @@ def main(args):
     print(
         f"Embedding generation for {len(passages)} passages."
     )
+    if not passages:
+        raise ValueError(
+            f"No passages were loaded from {args.passages}. "
+            "Check the preprocess step output and raw data paths."
+        )
     documents = [preprocess_passage_to_doc(p) for p in passages]
     passages = [d.content for d in documents]
     
