@@ -176,7 +176,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--generation_model_name",
         type=str,
-        default='meta-llama/Meta-Llama-3.1-8B-Instruct',
+        default='meta-llama/Llama-3.1-8B-Instruct',
         help="Generation model name"
     )
     parser.add_argument(

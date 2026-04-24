@@ -164,17 +164,17 @@ class Indexer(object):
         )
         
         embeddings = embeddings.astype('float32')
-        
-        pbar = tqdm(
-            zip(embeddings, documents),
-            desc=f"Indexing",
-            total=len(documents)
+        start_faiss_id = len(self.faiss_id_to_docstore_id)
+
+        self.faiss_index.add(embeddings)
+        self.docstore.add(documents)
+        self.faiss_id_to_docstore_id.extend(document.id for document in documents)
+        self.docstore_id_to_faiss_id.update(
+            {
+                document.id: start_faiss_id + offset
+                for offset, document in enumerate(documents)
+            }
         )
-        
-        for embedding, document in pbar:
-            self.faiss_index.add(embedding[np.newaxis, :])
-            self.docstore._add(document)
-            self.faiss_id_to_docstore_id.append(document.id)
             
     def get_embedding_from_docstore_id(
         self,

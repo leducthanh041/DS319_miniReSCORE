@@ -2,7 +2,8 @@
 # Source: https://github.com/StonyBrookNLP/ircot
 
 """
-raw file to .tsv
+Prepare corpus passages as `data/embed_ready_data/*.tsv` for retrieval DB build.
+This does not generate `data/processed_data/*.jsonl` used by train/inference.
 """
 
 
@@ -47,6 +48,10 @@ def hash_object(o: Any) -> str:
         return base58.b58encode(m.digest()).decode()
 
 
+def sanitize_tsv_field(text: str) -> str:
+    return text.replace("\n", " ").replace("\t", " ").strip()
+
+
 def make_hotpotqa_documents_tsv(
     output_filepath: str,
     metadata: Dict = None
@@ -73,8 +78,8 @@ def make_hotpotqa_documents_tsv(
                 paragraph_index = 0
 
                 # Write the passage data to the TSV file
-                paragraph_text = paragraph_text.replace('\n', ' ').strip()
-                title = title.replace('\n', ' ').strip()
+                paragraph_text = sanitize_tsv_field(paragraph_text)
+                title = sanitize_tsv_field(title)
                 tsv_file.write(f"{id_}\t{paragraph_text}\t{title}\n")
                 metadata["idx"] += 1
                 num_passages += 1
@@ -125,8 +130,8 @@ def make_iirc_documents_tsv(
                     is_abstract = paragraph_index == 0
 
                     # Write the passage data to the TSV file
-                    paragraph_text = paragraph_text.replace('\n', ' ').strip()
-                    title = title.replace('\n', ' ').strip()
+                    paragraph_text = sanitize_tsv_field(paragraph_text)
+                    title = sanitize_tsv_field(title)
                     tsv_file.write(f"{id_}\t{paragraph_text}\t{title}\n")
                     metadata["idx"] += 1
                     
@@ -168,8 +173,8 @@ def make_2wikimultihopqa_documents_tsv(
                         id_ = full_id[:32]
 
                         # Write the passage data to the TSV file
-                        paragraph_text = paragraph_text.replace('\n', ' ').strip()
-                        title = title.replace('\n', ' ').strip()
+                        paragraph_text = sanitize_tsv_field(paragraph_text)
+                        title = sanitize_tsv_field(title)
                         tsv_file.write(f"{id_}\t{paragraph_text}\t{title}\n")
                         metadata["idx"] += 1
 
@@ -216,8 +221,8 @@ def make_musique_documents_tsv(
                         id_ = full_id[:32]
 
                         # Write the passage data to the TSV file
-                        paragraph_text = paragraph_text.replace('\n', ' ').strip()
-                        title = title.replace('\n', ' ').strip()
+                        paragraph_text = sanitize_tsv_field(paragraph_text)
+                        title = sanitize_tsv_field(title)
                         tsv_file.write(f"{id_}\t{paragraph_text.strip() if paragraph_text else 'None'}\t{title.strip() if title.strip() else 'None'}\n")
                         metadata["idx"] += 1
 

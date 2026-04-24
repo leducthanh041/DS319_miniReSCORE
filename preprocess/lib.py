@@ -3,12 +3,10 @@ import json
 from typing import List, Dict
 from pathlib import Path
 
-import _jsonnet
-from rapidfuzz import fuzz
-import requests
-
 
 def get_retriever_address(suffix: str = ""):
+    import _jsonnet
+
     retriever_address_config_filepath = ".retriever_address.jsonnet"
     if not os.path.exists(retriever_address_config_filepath):
         raise Exception(f"Retriver address filepath ({retriever_address_config_filepath}) not available.")
@@ -20,6 +18,8 @@ def get_retriever_address(suffix: str = ""):
     return retriever_address_config
 
 def get_llm_server_address(llm_port_num : str):
+    import _jsonnet
+
     llm_server_address_config_filepath = ".llm_server_address.jsonnet"
     if not os.path.exists(llm_server_address_config_filepath):
         raise Exception(f"LLM Server address filepath ({llm_server_address_config_filepath}) not available.")
@@ -32,6 +32,8 @@ def get_llm_server_address(llm_port_num : str):
 
 
 def get_roscoe_server_address(suffix: str = ""):
+    import _jsonnet
+
     roscoe_server_address_config_filepath = ".roscoe_server_address.jsonnet"
     if not os.path.exists(roscoe_server_address_config_filepath):
         raise Exception(f"Retriver address filepath ({roscoe_server_address_config_filepath}) not available.")
@@ -108,6 +110,8 @@ def write_jsonl(instances: List[Dict], file_path: str):
 
 
 def find_matching_paragraph_text(corpus_name: str, original_paragraph_text: str) -> str:
+    import requests
+    from rapidfuzz import fuzz
 
     retriever_address_config = get_retriever_address()
     retriever_host = str(retriever_address_config["host"])

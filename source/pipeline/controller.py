@@ -78,17 +78,23 @@ class PipelineController(object):
     ):
         self.update(start_states)
 
-        total_loss = torch.tensor(0.0, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        total_loss = None
         step_count = 0 
         while not self.is_running_completed:
             step_count += 1
             loss = self.train_once()
-            total_loss += loss 
+            if total_loss is None:
+                total_loss = loss
+            else:
+                total_loss = total_loss + loss
         if step_count > 0:
             total_loss = total_loss / float(step_count)
         else:
             print("Warning: No steps were executed, returning zero loss.")
-            total_loss = torch.tensor(0.0, device=device)
+            total_loss = torch.tensor(
+                0.0,
+                device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            )
 
         return total_loss
         
@@ -107,6 +113,19 @@ class PipelineController(object):
                 self.update(next_states)
 
         return loss
+
+    def update_trainstep(
+        self,
+        states: List[BaseState],
+    ):
+        assert len(self.running_state_ids) == 0, (
+            "Running states should be reset before update_trainstep"
+        )
+
+        for state in states:
+            if state.state_id not in self.state_tree:
+                self.state_tree[state.state_id] = state
+            self.running_state_ids.append(state.state_id)
 
     @property
     def is_running_completed(

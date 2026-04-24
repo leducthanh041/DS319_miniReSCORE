@@ -7,6 +7,7 @@ import gc
 from typing import List, Literal, Optional, Any
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.utils import is_accelerate_available
 from vllm import LLM, SamplingParams
 import torch
 from math import exp
@@ -19,12 +20,7 @@ FORCE_RESET = bool(int(os.getenv("FORCE_RESET", "0")))
 @dataclass
 class LlamaGeneratorConfig(BaseGeneratorConfig):
     # Base Setting
-    model_name: Optional[
-        Literal[
-            'meta-llama/Meta-Llama-3.1-8B',
-            'meta-llama/Meta-Llama-3.1-8B-Instruct',
-        ]
-    ] = 'meta-llama/Meta-Llama-3.1-8B-Instruct'
+    model_name: Optional[str] = 'meta-llama/Llama-3.1-8B-Instruct'
     max_total_tokens: Optional[int] = 4096
     max_new_tokens: Optional[int] = 1024
     min_new_tokens: Optional[int] = 1
@@ -48,50 +44,107 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     use_vllm: Optional[bool] = True
     eos_text: Optional[str] = None
     gpu : Optional[int] = None
+    device_map: Optional[str] = None
+    max_memory_per_gpu: Optional[str] = None
     
 
 class LlamaGenerator(BaseGenerator):
+
+    @staticmethod
+    def _reraise_with_model_hint(error: Exception, model_name: str):
+        message = str(error)
+        if ("gated repo" in message.lower()) or ("public gated repositories" in message.lower()):
+            raise OSError(
+                f"Failed to access model '{model_name}'. "
+                "This model is gated. If you use a fine-grained Hugging Face token, "
+                "enable 'Read access to contents of all public gated repositories you can access'. "
+                "A plain 'read' token also works for gated model downloads if your account already has access. "
+                "Then export HF_TOKEN and rerun."
+            ) from error
+        raise error
+
+    @staticmethod
+    def _resolve_hf_token():
+        return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     
     def __init__(
         self,
         cfg: LlamaGeneratorConfig = LlamaGeneratorConfig()
     ):
         super().__init__(cfg)
+        self.hf_token = self._resolve_hf_token()
 
-        if self.cfg.gpu:
+        if self.cfg.gpu is not None and torch.cuda.is_available():
             self.device = torch.device(f'cuda:{self.cfg.gpu}' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if self.cfg.use_vllm: 
+            tensor_parallel_size = torch.cuda.device_count() if self.device.type == 'cuda' else 1
             self.model = LLM( 
                 model=self.cfg.model_name, 
                 gpu_memory_utilization=self.cfg.gpu_memory_utilization, 
                 max_model_len=self.cfg.max_total_tokens, 
-                tensor_parallel_size=torch.cuda.device_count(),
-                device=self.device,
+                tensor_parallel_size=max(1, tensor_parallel_size),
+                device=self.device.type,
                 # enable_prefix_caching=True
             )
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.cfg.model_name, 
+                token=self.hf_token,
             )
+            self.input_device = self.device
 
         else:
-            # self.hf_device_map = "auto"
-            self.hf_device_map = { "": self.device }
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.cfg.model_name,
-                device_map=self.hf_device_map
-            )
+            self.hf_device_map = None
+            model_kwargs = {
+                "low_cpu_mem_usage": True,
+            }
+            if self.device.type == 'cuda':
+                model_kwargs["torch_dtype"] = torch.float16
+
+            if self.cfg.gpu is not None:
+                self.hf_device_map = {"": self.device}
+            elif self.cfg.device_map:
+                if self.cfg.device_map == "auto" and not is_accelerate_available():
+                    raise RuntimeError(
+                        "device_map='auto' requires accelerate. Install accelerate or pass --generator_gpu."
+                    )
+                self.hf_device_map = self.cfg.device_map
+                if self.cfg.max_memory_per_gpu and torch.cuda.is_available():
+                    model_kwargs["max_memory"] = {
+                        gpu_idx: self.cfg.max_memory_per_gpu
+                        for gpu_idx in range(torch.cuda.device_count())
+                    }
+            elif self.device.type == 'cuda':
+                self.hf_device_map = {"": self.device}
+
+            if self.hf_device_map is not None:
+                model_kwargs["device_map"] = self.hf_device_map
+            if self.hf_token:
+                model_kwargs["token"] = self.hf_token
+
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.cfg.model_name,
+                    **model_kwargs
+                )
+            except OSError as error:
+                self._reraise_with_model_hint(error, self.cfg.model_name)
             self.model.eval()  # Set the model to evaluation mode
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.cfg.model_name, 
-            )
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.cfg.model_name,
+                    token=self.hf_token,
+                )
+            except OSError as error:
+                self._reraise_with_model_hint(error, self.cfg.model_name)
             self.pad_token_initialized = False
             if self.tokenizer.pad_token is None:
                 self.tokenizer.add_special_tokens({'pad_token': "<PAD>"})
                 self.model.resize_token_embeddings(len(self.tokenizer))
                 self.pad_token_initialized = True
-            
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.input_device = self._resolve_input_device()
 
         self.tokenizer.padding_side = 'left'  # Set padding side to left for decoder model
             
@@ -103,6 +156,24 @@ class LlamaGenerator(BaseGenerator):
         else:
             self.stopping_criteria_list = None
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+
+    def _resolve_input_device(self):
+        if self.device.type != 'cuda':
+            return self.device
+
+        if isinstance(self.hf_device_map, dict):
+            for mapped_device in self.hf_device_map.values():
+                if isinstance(mapped_device, int):
+                    return torch.device(f'cuda:{mapped_device}')
+                if isinstance(mapped_device, torch.device):
+                    return mapped_device
+                if isinstance(mapped_device, str) and mapped_device.startswith('cuda'):
+                    return torch.device(mapped_device)
+
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return self.device
     
     @torch.no_grad()
     def _generate(
@@ -137,7 +208,7 @@ class LlamaGenerator(BaseGenerator):
                 padding=self.cfg.padding
             )
             model_inputs = {
-                k:v.cuda() 
+                k:v.to(self.input_device)
                 for k, v in model_inputs.items()
             }
             input_ids_length = model_inputs['input_ids'].shape[1]
@@ -182,11 +253,11 @@ class LlamaGenerator(BaseGenerator):
             
             input_ids = self.tokenizer.encode(
                 input_text, return_tensors='pt'
-            ).to(self.device)
+            ).to(self.input_device)
             
             answer_ids = self.tokenizer.encode(
                 output_text, return_tensors='pt', add_special_tokens=False
-            ).to(self.device)
+            ).to(self.input_device)
             
             log_prob_sum = 0.0
             
@@ -206,10 +277,10 @@ class LlamaGenerator(BaseGenerator):
 
 if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = "0"
-    # tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3.1-8B-Instruct')
+    # tokenizer = AutoTokenizer.from_pretrained('meta-llama/Llama-3.1-8B-Instruct')
     model = LlamaGenerator(
         LlamaGeneratorConfig(
-            model_name='meta-llama/Meta-Llama-3.1-8B-Instruct',
+            model_name='meta-llama/Llama-3.1-8B-Instruct',
             max_total_tokens=128,
             max_new_tokens=16,
             min_new_tokens=1,

@@ -38,6 +38,7 @@ class DenseRetrieverConfig(BaseRetrieverConfig):
     pooling: Optional[Literal['average', 'cls']] = 'average'
     max_length: Optional[int] = 512
     normalize: Optional[bool] = False
+    device: Optional[str] = None
 
 
 class DenseRetriever(BaseRetriever):
@@ -47,6 +48,9 @@ class DenseRetriever(BaseRetriever):
         cfg: DenseRetrieverConfig = DenseRetrieverConfig()
     ):
         self.cfg = cfg
+        self.device = torch.device(
+            self.cfg.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        )
         
         assert self.cfg.query_model_name_or_path != None, (
             "You must specify query model name."
@@ -58,15 +62,15 @@ class DenseRetriever(BaseRetriever):
         self.query_tokenizer = AutoTokenizer.from_pretrained(
             self.cfg.query_model_name_or_path
         )
-        self.query_model = self.query_model.cuda()
+        self.query_model = self.query_model.to(self.device)
         if self.cfg.passage_model_name_or_path != None:
-            self.query_model = AutoModel.from_pretrained(
+            self.passage_model = AutoModel.from_pretrained(
                 self.cfg.passage_model_name_or_path
             )
-            self.query_tokenizer = AutoTokenizer.from_pretrained(
+            self.passage_tokenizer = AutoTokenizer.from_pretrained(
                 self.cfg.passage_model_name_or_path
             )
-            self.passage_model = self.passage_model.cuda()
+            self.passage_model = self.passage_model.to(self.device)
         else:
             self.passage_model = copy.deepcopy(self.query_model)
             self.passage_tokenizer = self.query_tokenizer
@@ -104,7 +108,7 @@ class DenseRetriever(BaseRetriever):
             truncation=True,
         )
         model_inputs = {
-            k:v.cuda() 
+            k:v.to(self.device)
             for k, v in model_inputs.items()
         }
         model_outputs = self.passage_model(**model_inputs)
@@ -131,7 +135,7 @@ class DenseRetriever(BaseRetriever):
             truncation=True,
         )
         model_inputs = {
-            k:v.cuda() 
+            k:v.to(self.device)
             for k, v in model_inputs.items()
         }
         model_outputs = self.query_model(**model_inputs)

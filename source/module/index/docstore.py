@@ -40,6 +40,15 @@ class Document:
     
 
 class Docstore():
+    @staticmethod
+    def _configure_connection(conn: sqlite3.Connection) -> None:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA busy_timeout=60000")
+        conn.commit()
+
     def __init__(
         self, 
         database_path: str,
@@ -47,6 +56,7 @@ class Docstore():
         conn: Optional[sqlite3.Connection] = None
         ):
         self.database_path = database_path
+        os.makedirs(database_path, exist_ok=True)
         self.sqlite_path = os.path.join(
             database_path, sqlite_file_name
         )
@@ -60,7 +70,8 @@ class Docstore():
             # Initialize DB
             conn = sqlite3.connect(
                 self.sqlite_path, 
-                check_same_thread=False
+                check_same_thread=False,
+                timeout=60,
             )
             c = conn.cursor()
             c.execute('''
@@ -70,7 +81,7 @@ class Docstore():
                 metadata TEXT
             )
             ''')
-            conn.commit()
+            self._configure_connection(conn)
             print(f'Initialize Database at {self.sqlite_path}')
             
         self.conn = conn
@@ -87,8 +98,10 @@ class Docstore():
         )
         conn = sqlite3.connect(
             database=sqlite_path, 
-            check_same_thread=False
+            check_same_thread=False,
+            timeout=60,
         )
+        cls._configure_connection(conn)
         obj = cls(
             database_path=database_path,
             sqlite_file_name=sqlite_file_name,
@@ -101,11 +114,27 @@ class Docstore():
         self,
         docs: Union[Document, List[Document]]
     ):
-        if type(docs) == list:
-            for doc in docs:
-                self._add(doc)
-        else:
-            self._add(doc)
+        if type(docs) != list:
+            docs = [docs]
+
+        rows = [
+            (
+                doc.id,
+                doc.content,
+                json.dumps(doc.metadata),
+            )
+            for doc in docs
+        ]
+
+        c = self.conn.cursor()
+        c.executemany(
+            '''
+            INSERT OR REPLACE INTO documents (id, content, metadata) 
+            VALUES (?, ?, ?)
+            ''',
+            rows,
+        )
+        self.conn.commit()
         
         
     def _add(

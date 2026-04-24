@@ -1,25 +1,21 @@
-import os
 import json
+import os
 from collections import Counter
-from typing import List, Dict
+from typing import Dict, List
 
 from tqdm import tqdm
-from datasets import load_dataset
 
 
 def write_hotpotqa_instances_to_filepath(instances: List[Dict], full_filepath: str):
-
-    max_num_tokens = 1000  # clip later.
-
+    max_num_tokens = 1000
     hop_sizes = Counter()
-    print(f"Writing in: {full_filepath}")
-    with open(full_filepath, "w") as full_file:
-        for raw_instance in tqdm(instances):
 
-            # Generic RC Format
+    print(f"Writing in: {full_filepath}")
+    with open(full_filepath, "w", encoding="utf-8") as full_file:
+        for raw_instance in tqdm(instances):
             processed_instance = {}
             processed_instance["dataset"] = "hotpotqa"
-            processed_instance["question_id"] = raw_instance["id"]
+            processed_instance["question_id"] = raw_instance["_id"]
             processed_instance["question_text"] = raw_instance["question"]
             processed_instance["level"] = raw_instance["level"]
             processed_instance["type"] = raw_instance["type"]
@@ -31,27 +27,29 @@ def write_hotpotqa_instances_to_filepath(instances: List[Dict], full_filepath: s
             }
             processed_instance["answers_objects"] = [answers_object]
 
-            raw_context = raw_instance.pop("context")
-            supporting_titles = raw_instance.pop("supporting_facts")["title"]
+            raw_context = raw_instance["context"]
+            supporting_titles = [title for title, _ in raw_instance["supporting_facts"]]
 
             title_to_paragraph = {
-                title: "".join(text) for title, text in zip(raw_context["title"], raw_context["sentences"])
+                title: "".join(text)
+                for title, text in raw_context
             }
             paragraph_to_title = {
-                "".join(text): title for title, text in zip(raw_context["title"], raw_context["sentences"])
+                "".join(text): title
+                for title, text in raw_context
             }
 
-            gold_paragraph_texts = [title_to_paragraph[title] for title in supporting_titles]
-            gold_paragraph_texts = set(list(gold_paragraph_texts))
+            gold_paragraph_texts = [title_to_paragraph[title] for title in supporting_titles if title in title_to_paragraph]
+            gold_paragraph_texts = set(gold_paragraph_texts)
 
-            paragraph_texts = ["".join(paragraph) for paragraph in raw_context["sentences"]]
+            paragraph_texts = ["".join(paragraph) for _, paragraph in raw_context]
             paragraph_texts = list(set(paragraph_texts))
 
             processed_instance["contexts"] = [
                 {
                     "idx": index,
                     "title": paragraph_to_title[paragraph_text].strip(),
-                    "paragraph_text": paragraph_text.strip(),
+                    "paragraph_text": " ".join(paragraph_text.strip().split(" ")[:max_num_tokens]),
                     "is_supporting": paragraph_text in gold_paragraph_texts,
                 }
                 for index, paragraph_text in enumerate(paragraph_texts)
@@ -60,23 +58,25 @@ def write_hotpotqa_instances_to_filepath(instances: List[Dict], full_filepath: s
             supporting_contexts = [context for context in processed_instance["contexts"] if context["is_supporting"]]
             hop_sizes[len(supporting_contexts)] += 1
 
-            for context in processed_instance["contexts"]:
-                context["paragraph_text"] = " ".join(context["paragraph_text"].split(" ")[:max_num_tokens])
-
-            full_file.write(json.dumps(processed_instance) + "\n")
+            full_file.write(json.dumps(processed_instance, ensure_ascii=False) + "\n")
 
     print(f"Hop-sizes: {str(hop_sizes)}")
 
 
+def read_hotpotqa_instances(file_path: str) -> List[Dict]:
+    with open(file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
+
+
 if __name__ == "__main__":
-
-    dataset = load_dataset("hotpot_qa", "distractor")
-
     directory = os.path.join("data", "processed_data", "hotpotqa")
     os.makedirs(directory, exist_ok=True)
 
-    processed_full_filepath = os.path.join(directory, "train.jsonl")
-    write_hotpotqa_instances_to_filepath(dataset["train"], processed_full_filepath)
+    raw_train_path = os.path.join("data", "raw_data", "hotpotqa", "hotpot_train_v1.1.json")
+    raw_dev_path = os.path.join("data", "raw_data", "hotpotqa", "hotpot_dev_distractor_v1.json")
 
-    processed_full_filepath = os.path.join(directory, "dev.jsonl")
-    write_hotpotqa_instances_to_filepath(dataset["validation"], processed_full_filepath)
+    processed_train_filepath = os.path.join(directory, "train.jsonl")
+    write_hotpotqa_instances_to_filepath(read_hotpotqa_instances(raw_train_path), processed_train_filepath)
+
+    processed_dev_filepath = os.path.join(directory, "dev.jsonl")
+    write_hotpotqa_instances_to_filepath(read_hotpotqa_instances(raw_dev_path), processed_dev_filepath)
