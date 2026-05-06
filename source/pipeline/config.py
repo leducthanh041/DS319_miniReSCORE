@@ -80,6 +80,7 @@ class PipelineConfig:
     retrieval_batch_size: Optional[int] = 32
     retrieval_training_strategy: Optional[Literal['query_only', 'both']] = 'query_only'
     retrieval_use_fp16: Optional[int] = True
+    database_path_override: Optional[str] = None
     
     # End
     max_num_thought: int = 6
@@ -104,13 +105,14 @@ class PipelineConfig:
     def __post_init__(self):
         seed_everything(self.seed)
         
-        if self.method == "iqatr":
+        if self.method in {"rescore", "iqatr"}:
             self.min_num_thought = 1
         elif self.method == "base":
             self.min_num_thought = 0
         else:
-            print("Not Implemented")
-            self.min_num_thought = 0    
+            raise NotImplementedError(
+                f"Unsupported method: {self.method}. Supported methods: rescore, iqatr, base"
+            )
             
         if self.wandb_key:
             wandb.login(
@@ -128,6 +130,8 @@ class PipelineConfig:
 
     @property
     def database_path(self):
+        if self.database_path_override:
+            return self.database_path_override
         
         if self.retrieval_passage_model_name_or_path:
             index_folder_name = self.retrieval_passage_model_name_or_path

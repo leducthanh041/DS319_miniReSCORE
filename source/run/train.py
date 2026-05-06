@@ -1,6 +1,6 @@
 import os
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2,3,4,5")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1,2")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -74,7 +74,7 @@ def parse_args():
 
     parser.add_argument("--method", type=str, default="rescore", help="Method name")
     parser.add_argument("--running_name", type=str, default=None, help="Name for the run")
-    parser.add_argument("--batch_size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--batch_size", type=int, default=20, help="Training batch size")
     parser.add_argument("--seed", type=int, default=100, help="Random seed")
     parser.add_argument(
         "--dataset",
@@ -120,7 +120,7 @@ def parse_args():
     parser.add_argument(
         "--generation_max_total_tokens",
         type=int,
-        default=3072,
+        default=4096,
         help="Max total tokens for generation/scoring",
     )
     parser.add_argument("--generation_max_new_tokens", type=int, default=64, help="Max new tokens")
@@ -134,8 +134,14 @@ def parse_args():
     parser.add_argument(
         "--generation_max_memory_per_gpu",
         type=str,
-        default="9GiB",
+        default="10GiB",
         help="Max memory per visible GPU for generator when device_map=auto",
+    )
+    parser.add_argument(
+        "--generation_max_memory_map",
+        type=str,
+        default=None,
+        help="Per-device generator max memory map, for example '0:7GiB,1:7GiB,2:7GiB' to reserve cuda:3",
     )
     parser.add_argument("--generator_gpu", type=int, default=None, help="Single GPU id for generator")
 
@@ -167,7 +173,13 @@ def parse_args():
         default=None,
         help="Retriever passage encoder",
     )
-    parser.add_argument("--retrieval_batch_size", type=int, default=16, help="Retriever embedding batch size")
+    parser.add_argument("--retrieval_batch_size", type=int, default=32, help="Retriever embedding batch size")
+    parser.add_argument(
+        "--database_path",
+        type=str,
+        default=None,
+        help="Override retrieval DB directory containing docstore.db, index.faiss, and faiss_id_to_docstore_id.pkl",
+    )
     parser.add_argument(
         "--retrieval_training_strategy",
         choices=["query_only", "both"],
@@ -183,7 +195,7 @@ def parse_args():
     parser.add_argument(
         "--retriever_device",
         type=str,
-        default=None,
+        default="cuda:0" if torch.cuda.is_available() else "cpu",
         help="Retriever device, for example cuda:3 or cpu",
     )
 
@@ -193,21 +205,46 @@ def parse_args():
     parser.add_argument("--demo", action="store_true", help="Use demo subset")
 
     parser.add_argument("--n_epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--temperature_r", type=float, default=0.1, help="Retriever temperature")
     parser.add_argument("--temperature_lm", type=float, default=1.0, help="LM temperature")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=8,
+        default=4,
         help="Gradient accumulation steps",
     )
     parser.add_argument("--wandb_key", type=str, default=None, help="WandB API key")
 
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
-    parser.add_argument("--validation_freq", type=int, default=100, help="Run validation every N steps")
-    parser.add_argument("--save_freq", type=int, default=100, help="Save retriever every N steps")
+    parser.add_argument("--num_workers", type=int, default=256, help="DataLoader workers")
+    parser.add_argument("--validation_freq", type=int, default=10, help="Run validation every N steps")
+    parser.add_argument(
+        "--validation_batch_size",
+        type=int,
+        default=None,
+        help="Validation batch size; defaults to training batch size",
+    )
+    parser.add_argument(
+        "--validation_max_batches",
+        type=int,
+        default=0,
+        help="Limit validation to N batches; <=0 means full dev set",
+    )
+    parser.add_argument("--save_freq", type=int, default=10, help="Save retriever every N steps")
     parser.add_argument("--runtime_log_root", type=str, default="./logs/train", help="Runtime log root directory")
+    parser.add_argument("--early_stopping", action="store_true", help="Stop when validation loss stops improving")
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=5,
+        help="Stop after this many validation checks without improvement",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation loss improvement to reset early-stopping patience",
+    )
 
     return parser.parse_args()
 
@@ -218,6 +255,8 @@ def build_pipeline_config(args):
         key: value for key, value in vars(args).items()
         if key in cfg_field_names
     }
+    if args.database_path:
+        cfg_kwargs["database_path_override"] = args.database_path
     cfg_kwargs["train"] = True
     if not cfg_kwargs.get("running_name"):
         cfg_kwargs["running_name"] = f"train_{cfg_kwargs['dataset']}"
@@ -356,6 +395,26 @@ def reset_controller_state(controller):
     controller.end_state_ids.clear()
 
 
+def safe_cuda_empty_cache(context):
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except RuntimeError as error:
+        print(
+            f"[cuda-error] CUDA cache cleanup failed at {context}. "
+            "This usually means an earlier CUDA kernel failed asynchronously."
+        )
+        print(f"[cuda-error] {error}")
+        print(
+            "[cuda-error] Stop this run and resume from the latest/best checkpoint. "
+            "For exact fault location, rerun a short debug pass with CUDA_LAUNCH_BLOCKING=1."
+        )
+        raise
+
+
 def build_start_states(inputs, id_to_ground_truths):
     return [
         QuestionState(
@@ -378,7 +437,16 @@ def build_dataloader(start_states, batch_size, num_workers):
     )
 
 
-def validate(cfg, controller, epoch, num_steps, demo, num_workers):
+def validate(
+    cfg,
+    controller,
+    epoch,
+    num_steps,
+    demo,
+    num_workers,
+    validation_batch_size=None,
+    validation_max_batches=0,
+):
     total_loss = 0.0
     total_batches = 0
 
@@ -396,7 +464,8 @@ def validate(cfg, controller, epoch, num_steps, demo, num_workers):
         is_demo=demo,
     )
     dev_start_states = build_start_states(dev_inputs, dev_id_to_ground_truths)
-    dev_dataloader = build_dataloader(dev_start_states, cfg.batch_size, num_workers)
+    dev_batch_size = validation_batch_size or cfg.batch_size
+    dev_dataloader = build_dataloader(dev_start_states, dev_batch_size, num_workers)
 
     with torch.no_grad():
         for batch in dev_dataloader:
@@ -404,13 +473,24 @@ def validate(cfg, controller, epoch, num_steps, demo, num_workers):
             total_loss += batch_loss.item()
             total_batches += 1
             reset_controller_state(controller)
+            if validation_max_batches > 0 and total_batches >= validation_max_batches:
+                break
 
     avg_loss = total_loss / max(total_batches, 1)
-    print(f"[validation] epoch={epoch} step={num_steps} avg_loss={avg_loss:.6f}")
+    limit_msg = (
+        f" limited_to={validation_max_batches}"
+        if validation_max_batches > 0
+        else ""
+    )
+    print(
+        f"[validation] epoch={epoch} step={num_steps} "
+        f"avg_loss={avg_loss:.6f} batches={total_batches}{limit_msg}"
+    )
 
     retriever.query_model.train(query_model_was_training)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    safe_cuda_empty_cache(f"validation epoch={epoch} step={num_steps}")
+
+    return avg_loss
 
 
 def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
@@ -442,6 +522,21 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
     print(f"Training examples: {len(start_states)}")
     print(f"Prediction directory: {cfg.prediction_file_dir}")
     print(f"Pipeline JSON log: {cfg.logging_file_path}")
+    print(
+        "Validation config: "
+        f"freq={args.validation_freq}, "
+        f"batch_size={args.validation_batch_size or cfg.batch_size}, "
+        f"max_batches={args.validation_max_batches if args.validation_max_batches > 0 else 'full'}, "
+        f"early_stopping={args.early_stopping}, "
+        f"patience={args.early_stopping_patience}, "
+        f"min_delta={args.early_stopping_min_delta}"
+    )
+
+    best_val_loss = float("inf")
+    bad_validation_count = 0
+    should_stop = False
+    if args.early_stopping and args.validation_freq <= 0:
+        print("[early-stopping] disabled because validation_freq <= 0")
 
     for epoch in range(cfg.n_epochs):
         num_steps = 0
@@ -484,7 +579,52 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
             reset_controller_state(controller)
 
             if args.validation_freq > 0 and num_steps % args.validation_freq == 0:
-                validate(cfg, controller, epoch, num_steps, cfg.demo, args.num_workers)
+                val_loss = validate(
+                    cfg,
+                    controller,
+                    epoch,
+                    num_steps,
+                    cfg.demo,
+                    args.num_workers,
+                    validation_batch_size=args.validation_batch_size,
+                    validation_max_batches=args.validation_max_batches,
+                )
+
+                if cfg.wandb_key:
+                    wandb.log(
+                        {
+                            "validation_loss": val_loss,
+                            "epoch": epoch,
+                            "step": num_steps,
+                        }
+                    )
+
+                if args.early_stopping:
+                    improved = val_loss < best_val_loss - args.early_stopping_min_delta
+                    if improved:
+                        best_val_loss = val_loss
+                        bad_validation_count = 0
+                        best_path = os.path.join(cfg.prediction_file_dir, "best_validation")
+                        retriever.query_model.save_pretrained(best_path)
+                        retriever.query_tokenizer.save_pretrained(best_path)
+                        print(
+                            f"[early-stopping] improvement val_loss={val_loss:.6f}; "
+                            f"saved best retriever to {best_path}"
+                        )
+                    else:
+                        bad_validation_count += 1
+                        print(
+                            f"[early-stopping] no improvement "
+                            f"({bad_validation_count}/{args.early_stopping_patience}); "
+                            f"best_val_loss={best_val_loss:.6f}"
+                        )
+                        if bad_validation_count >= args.early_stopping_patience:
+                            print(
+                                f"[early-stopping] stopping at epoch={epoch} step={num_steps} "
+                                f"after {bad_validation_count} validation checks without improvement"
+                            )
+                            should_stop = True
+                            break
 
             if args.save_freq > 0 and num_steps % args.save_freq == 0:
                 save_path = os.path.join(cfg.prediction_file_dir, f"epoch_{epoch}_step_{num_steps}")
@@ -492,8 +632,14 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
                 retriever.query_tokenizer.save_pretrained(save_path)
                 print(f"[checkpoint] saved retriever to {save_path}")
 
-            if torch.cuda.is_available() and num_steps % 20 == 0:
-                torch.cuda.empty_cache()
+            if num_steps % 20 == 0:
+                safe_cuda_empty_cache(f"train epoch={epoch} step={num_steps}")
+
+        if should_stop:
+            optimizer.zero_grad(set_to_none=True)
+            num_accumulations = 0
+            print(f"[epoch-end] epoch={epoch} stopped_early=True optimizer_steps={optimizer_steps}")
+            break
 
         if num_accumulations > 0:
             optimizer.step()
@@ -549,7 +695,8 @@ def main():
                 f"model={cfg.generation_model_name}, "
                 f"device_map={generation_device_map}, "
                 f"generator_gpu={args.generator_gpu}, "
-                f"max_memory_per_gpu={args.generation_max_memory_per_gpu}"
+                f"max_memory_per_gpu={args.generation_max_memory_per_gpu}, "
+                f"max_memory_map={args.generation_max_memory_map}"
             )
             print(
                 "Hugging Face auth: "
@@ -575,6 +722,7 @@ def main():
                     gpu=args.generator_gpu,
                     device_map=generation_device_map,
                     max_memory_per_gpu=args.generation_max_memory_per_gpu,
+                    max_memory_map=args.generation_max_memory_map,
                 )
             )
             retriever = DenseRetriever(

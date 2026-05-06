@@ -46,6 +46,7 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     gpu : Optional[int] = None
     device_map: Optional[str] = None
     max_memory_per_gpu: Optional[str] = None
+    max_memory_map: Optional[str] = None
     
 
 class LlamaGenerator(BaseGenerator):
@@ -66,6 +67,46 @@ class LlamaGenerator(BaseGenerator):
     @staticmethod
     def _resolve_hf_token():
         return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+    @staticmethod
+    def _parse_max_memory_map(max_memory_map: Optional[str]):
+        if not max_memory_map:
+            return None
+
+        parsed = {}
+        for item in max_memory_map.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                raise ValueError(
+                    "Invalid max memory map item "
+                    f"'{item}'. Expected format like '0:7GiB,1:7GiB,cpu:32GiB'."
+                )
+            device, memory = item.split(":", 1)
+            device = device.strip()
+            memory = memory.strip()
+            if not device or not memory:
+                raise ValueError(
+                    "Invalid max memory map item "
+                    f"'{item}'. Device and memory must both be set."
+                )
+
+            if device.lower() == "cpu":
+                parsed["cpu"] = memory
+            else:
+                try:
+                    parsed[int(device)] = memory
+                except ValueError as error:
+                    raise ValueError(
+                        "Invalid max memory map device "
+                        f"'{device}'. Use CUDA logical ids like 0,1,2 or 'cpu'."
+                    ) from error
+
+        if not parsed:
+            raise ValueError("max_memory_map was provided but no valid entries were parsed.")
+
+        return parsed
     
     def __init__(
         self,
@@ -111,7 +152,10 @@ class LlamaGenerator(BaseGenerator):
                         "device_map='auto' requires accelerate. Install accelerate or pass --generator_gpu."
                     )
                 self.hf_device_map = self.cfg.device_map
-                if self.cfg.max_memory_per_gpu and torch.cuda.is_available():
+                max_memory_map = self._parse_max_memory_map(self.cfg.max_memory_map)
+                if max_memory_map:
+                    model_kwargs["max_memory"] = max_memory_map
+                elif self.cfg.max_memory_per_gpu and torch.cuda.is_available():
                     model_kwargs["max_memory"] = {
                         gpu_idx: self.cfg.max_memory_per_gpu
                         for gpu_idx in range(torch.cuda.device_count())
@@ -141,9 +185,10 @@ class LlamaGenerator(BaseGenerator):
                 self._reraise_with_model_hint(error, self.cfg.model_name)
             self.pad_token_initialized = False
             if self.tokenizer.pad_token is None:
-                self.tokenizer.add_special_tokens({'pad_token': "<PAD>"})
-                self.model.resize_token_embeddings(len(self.tokenizer))
-                self.pad_token_initialized = True
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            if getattr(self.model.config, "pad_token_id", None) is None:
+                self.model.config.pad_token_id = self.tokenizer.pad_token_id
             self.input_device = self._resolve_input_device()
 
         self.tokenizer.padding_side = 'left'  # Set padding side to left for decoder model
@@ -213,11 +258,11 @@ class LlamaGenerator(BaseGenerator):
             }
             input_ids_length = model_inputs['input_ids'].shape[1]
             # Define the generation configuration
+            do_sample = self.cfg.temperature is not None and self.cfg.temperature > 0.
             generation_args = { 
                 "max_new_tokens":self.cfg.max_new_tokens, 
                 "min_length": self.cfg.min_new_tokens,
-                "do_sample": True if self.cfg.temperature != 0. else False,
-                "temperature": self.cfg.temperature,
+                "do_sample": do_sample,
                 "num_return_sequences": self.cfg.num_return_sequences,                
                 "repetition_penalty": self.cfg.repetition_penalty,
                 "length_penalty": self.cfg.length_penalty,
@@ -225,9 +270,12 @@ class LlamaGenerator(BaseGenerator):
                 "eos_token_id": self.tokenizer.eos_token_id,  # EOS token
                 "pad_token_id": self.tokenizer.pad_token_id,  # Padding token (important for batching)
             }
+            if do_sample:
+                generation_args["temperature"] = self.cfg.temperature
             # Generate outputs
             generated_outputs = self.model.generate(
-                input_ids=model_inputs['input_ids'], 
+                input_ids=model_inputs['input_ids'],
+                attention_mask=model_inputs.get('attention_mask'),
                 **generation_args
             )
             # Decode only the new tokens (exclude the input prompt)
@@ -248,18 +296,31 @@ class LlamaGenerator(BaseGenerator):
         method: Literal['perplexity_score'] = 'perplexity_score'
     ):
         perplexities = []
+        max_total_tokens = max(2, int(self.cfg.max_total_tokens or 4096))
     
         for input_text, output_text in zip(input_texts, output_texts):
-            
-            input_ids = self.tokenizer.encode(
-                input_text, return_tensors='pt'
-            ).to(self.input_device)
-            
             answer_ids = self.tokenizer.encode(
                 output_text, return_tensors='pt', add_special_tokens=False
-            ).to(self.input_device)
-            
-            log_prob_sum = 0.0
+            )
+            if answer_ids.shape[1] == 0:
+                answer_ids = torch.tensor(
+                    [[self.tokenizer.eos_token_id]],
+                    dtype=torch.long,
+                )
+
+            max_answer_tokens = max(1, max_total_tokens - 1)
+            if answer_ids.shape[1] > max_answer_tokens:
+                answer_ids = answer_ids[:, :max_answer_tokens]
+
+            max_input_tokens = max(1, max_total_tokens - answer_ids.shape[1])
+            input_ids = self.tokenizer.encode(
+                input_text,
+                return_tensors='pt',
+                max_length=max_input_tokens,
+                truncation=True,
+            )
+            input_ids = input_ids.to(self.input_device)
+            answer_ids = answer_ids.to(self.input_device)
             
             total_ids = torch.cat([input_ids, answer_ids], dim=1)
             logits = self.model(total_ids).logits.squeeze(0)
@@ -271,6 +332,7 @@ class LlamaGenerator(BaseGenerator):
                 F.cross_entropy(answer_logits, answer_labels) # , reduction='none'
             )
             perplexities.append(perplexity.item())  # Directly store the float
+            del input_ids, answer_ids, total_ids, logits, answer_logits, answer_labels, perplexity
             
         return perplexities  # This will return a list of floats
     
