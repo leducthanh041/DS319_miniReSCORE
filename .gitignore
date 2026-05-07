@@ -1,0 +1,78 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+.temp/
+.codex/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Logs and runtime outputs
+logs/
+*.log
+wandb/
+runs/
+outputs/
+
+# Data, indices, and generated artifacts
+data/
+database/
+index/
+embeddings/
+*.sqlite
+*.sqlite3
+*.db
+*.faiss
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# Model checkpoints and predictions
+predictions/
+predictions_docker_link
+checkpoints/
+checkpoint*/
+epoch_*_step_*/
+best_validation/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+
+# Temporary training artifacts
+train_*/
+tmp/
+temp/
