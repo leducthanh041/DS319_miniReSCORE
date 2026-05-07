@@ -23,6 +23,22 @@ from source.evaluation.metrics.support_em_f1 import SupportEmF1Metric
 from source.evaluation.metrics.answer_support_recall import AnswerSupportRecallMetric
 
 
+def _fallback_official_evaluation(
+    reason: str,
+    prediction_type: str,
+    id_to_ground_truths: Dict[str, Any],
+    id_to_predictions: Dict[str, Any],
+) -> Dict:
+    print(
+        "[warning] Official evaluation is unavailable; "
+        f"falling back to internal evaluation. Reason: {reason}"
+    )
+    metrics = evaluate_by_dicts(prediction_type, id_to_ground_truths, id_to_predictions)
+    metrics["official_evaluation_skipped"] = True
+    metrics["official_evaluation_skip_reason"] = reason
+    return metrics
+
+
 def answer_extractor(
     potentially_cot: str
 ) -> str:
@@ -113,6 +129,26 @@ def official_evaluate_by_dicts(
             print("WARNING: Found a list answer prediction, concatenating it.")
 
     os.makedirs(".temp", exist_ok=True)
+
+    official_evaluator_scripts = {
+        "hotpotqa": os.path.join(
+            "source", "evaluation", "official_evaluation", "hotpotqa", "hotpot_evaluate_v1.py"
+        ),
+        "2wikimultihopqa": os.path.join(
+            "source", "evaluation", "official_evaluation", "2wikimultihopqa", "2wikimultihop_evaluate_v1.1.py"
+        ),
+        "musique": os.path.join(
+            "source", "evaluation", "official_evaluation", "musique", "evaluate_v1.0.py"
+        ),
+    }
+    official_evaluator_script = official_evaluator_scripts.get(dataset)
+    if official_evaluator_script and not os.path.exists(official_evaluator_script):
+        return _fallback_official_evaluation(
+            reason=f"missing official evaluator script: {official_evaluator_script}",
+            prediction_type=prediction_type,
+            id_to_ground_truths=id_to_ground_truths,
+            id_to_predictions=id_to_predictions,
+        )
 
     if dataset == "hotpotqa":
         # prepare ground_truth file:

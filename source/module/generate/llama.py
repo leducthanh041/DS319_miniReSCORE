@@ -1,4 +1,7 @@
 import os
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -22,6 +25,7 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     # Base Setting
     model_name: Optional[str] = 'meta-llama/Llama-3.1-8B-Instruct'
     max_total_tokens: Optional[int] = 4096
+    max_model_len: Optional[int] = None
     max_new_tokens: Optional[int] = 1024
     min_new_tokens: Optional[int] = 1
 
@@ -40,6 +44,9 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     stop: Optional[str] = field(default_factory=list)
     include_stop_str_in_output: Optional['bool'] = True
     gpu_memory_utilization: Optional[float] = 0.8
+    dtype: Optional[str] = "half"
+    swap_space: Optional[float] = 0
+    cpu_offload_gb: Optional[float] = 0
     # vocab_size: Optional[int] = 128256 # TODO: llama vocab_size? 128256 by default
     use_vllm: Optional[bool] = True
     eos_text: Optional[str] = None
@@ -47,6 +54,7 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     device_map: Optional[str] = None
     max_memory_per_gpu: Optional[str] = None
     max_memory_map: Optional[str] = None
+    tensor_parallel_size: Optional[int] = None
     
 
 class LlamaGenerator(BaseGenerator):
@@ -121,12 +129,25 @@ class LlamaGenerator(BaseGenerator):
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if self.cfg.use_vllm: 
-            tensor_parallel_size = torch.cuda.device_count() if self.device.type == 'cuda' else 1
+            self.vllm_max_model_len = self.cfg.max_model_len or self.cfg.max_total_tokens
+            visible_gpu_count = torch.cuda.device_count() if self.device.type == 'cuda' else 0
+            tensor_parallel_size = self.cfg.tensor_parallel_size
+            if tensor_parallel_size is None:
+                tensor_parallel_size = visible_gpu_count if self.device.type == 'cuda' else 1
+            tensor_parallel_size = max(1, tensor_parallel_size)
+            if self.device.type == 'cuda' and tensor_parallel_size > visible_gpu_count:
+                raise ValueError(
+                    f"tensor_parallel_size={tensor_parallel_size} exceeds visible CUDA "
+                    f"device count={visible_gpu_count}. Check CUDA_VISIBLE_DEVICES."
+                )
             self.model = LLM( 
                 model=self.cfg.model_name, 
                 gpu_memory_utilization=self.cfg.gpu_memory_utilization, 
-                max_model_len=self.cfg.max_total_tokens, 
-                tensor_parallel_size=max(1, tensor_parallel_size),
+                max_model_len=self.vllm_max_model_len,
+                tensor_parallel_size=tensor_parallel_size,
+                dtype=self.cfg.dtype or "half",
+                swap_space=self.cfg.swap_space,
+                cpu_offload_gb=self.cfg.cpu_offload_gb,
                 device=self.device.type,
                 # enable_prefix_caching=True
             )
@@ -232,11 +253,15 @@ class LlamaGenerator(BaseGenerator):
                 temperature=self.cfg.temperature,
                 # top_p=self.cfg.top_p,
                 # top_k=self.cfg.top_k,
-                length_penalty=self.cfg.length_penalty,
                 stop=[self.tokenizer.eos_token, "<|eot_id|>"] + self.cfg.stop,
                 include_stop_str_in_output=self.cfg.include_stop_str_in_output,
                 max_tokens=self.cfg.max_new_tokens, # Maximum number of tokens to generate per output sequence.
                 min_tokens=self.cfg.min_new_tokens, # min_tokens
+                truncate_prompt_tokens=max(
+                    1,
+                    int(self.vllm_max_model_len or self.cfg.max_total_tokens or 4096)
+                    - int(self.cfg.max_new_tokens or 0),
+                ),
             )
             model_outputs = self.model.generate(
                 prompts=inputs, 
@@ -295,6 +320,9 @@ class LlamaGenerator(BaseGenerator):
         output_texts: List[str],
         method: Literal['perplexity_score'] = 'perplexity_score'
     ):
+        if self.cfg.use_vllm:
+            return self._score_with_vllm(input_texts, output_texts)
+
         perplexities = []
         max_total_tokens = max(2, int(self.cfg.max_total_tokens or 4096))
     
@@ -335,6 +363,96 @@ class LlamaGenerator(BaseGenerator):
             del input_ids, answer_ids, total_ids, logits, answer_logits, answer_labels, perplexity
             
         return perplexities  # This will return a list of floats
+
+    @staticmethod
+    def _extract_vllm_logprob(logprob_entry):
+        if hasattr(logprob_entry, "logprob"):
+            return float(logprob_entry.logprob)
+        if isinstance(logprob_entry, dict) and "logprob" in logprob_entry:
+            return float(logprob_entry["logprob"])
+        return float(logprob_entry)
+
+    def _score_with_vllm(
+        self,
+        input_texts: List[str],
+        output_texts: List[str],
+    ):
+        prompt_token_ids = []
+        answer_token_ids = []
+        answer_offsets = []
+
+        # vLLM needs room for at least one generated token even when we only
+        # read prompt logprobs, so keep the scored prompt below max_model_len.
+        max_prompt_tokens = max(
+            2,
+            int(getattr(self, "vllm_max_model_len", None) or self.cfg.max_total_tokens or 4096) - 1,
+        )
+        for input_text, output_text in zip(input_texts, output_texts):
+            cur_answer_ids = self.tokenizer.encode(
+                output_text,
+                add_special_tokens=False,
+            )
+            if not cur_answer_ids:
+                cur_answer_ids = [self.tokenizer.eos_token_id]
+
+            max_answer_tokens = max(1, max_prompt_tokens - 1)
+            cur_answer_ids = cur_answer_ids[:max_answer_tokens]
+
+            max_input_tokens = max(1, max_prompt_tokens - len(cur_answer_ids))
+            cur_input_ids = self.tokenizer.encode(
+                input_text,
+                max_length=max_input_tokens,
+                truncation=True,
+            )
+            if not cur_input_ids:
+                cur_input_ids = [self.tokenizer.eos_token_id]
+
+            answer_offsets.append(len(cur_input_ids))
+            answer_token_ids.append(cur_answer_ids)
+            prompt_token_ids.append(cur_input_ids + cur_answer_ids)
+
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            min_tokens=0,
+            prompt_logprobs=1,
+        )
+        model_outputs = self.model.generate(
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+
+        perplexities = []
+        for request_idx, model_output in enumerate(model_outputs):
+            prompt_logprobs = model_output.prompt_logprobs
+            cur_answer_ids = answer_token_ids[request_idx]
+            answer_offset = answer_offsets[request_idx]
+            token_logprobs = []
+
+            for token_offset, token_id in enumerate(cur_answer_ids):
+                position = answer_offset + token_offset
+                if prompt_logprobs is None or position >= len(prompt_logprobs):
+                    raise RuntimeError(
+                        "vLLM did not return enough prompt_logprobs for scoring. "
+                        "Try lowering generation_max_total_tokens or disable vLLM scoring."
+                    )
+
+                candidates = prompt_logprobs[position] or {}
+                logprob_entry = candidates.get(token_id)
+                if logprob_entry is None:
+                    logprob_entry = candidates.get(str(token_id))
+                if logprob_entry is None:
+                    raise RuntimeError(
+                        "vLLM prompt_logprobs did not include the target token. "
+                        "Increase prompt_logprobs support in vLLM or disable vLLM scoring."
+                    )
+                token_logprobs.append(self._extract_vllm_logprob(logprob_entry))
+
+            mean_negative_logprob = -sum(token_logprobs) / max(1, len(token_logprobs))
+            perplexities.append(exp(mean_negative_logprob))
+
+        return perplexities
     
 
 if __name__ == '__main__':

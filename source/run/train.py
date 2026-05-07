@@ -1,15 +1,22 @@
 import os
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1,2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "5,6")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import argparse
 import copy
+import multiprocessing as mp
 import sys
 from dataclasses import fields
 from datetime import datetime
 from typing import List
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 import torch
 import wandb
@@ -123,6 +130,12 @@ def parse_args():
         default=4096,
         help="Max total tokens for generation/scoring",
     )
+    parser.add_argument(
+        "--generation_max_model_len",
+        type=int,
+        default=4096,
+        help="vLLM max_model_len/KV-cache length when --generation_use_vllm is enabled. Use 2048/1024 on 11GB GPUs.",
+    )
     parser.add_argument("--generation_max_new_tokens", type=int, default=64, help="Max new tokens")
     parser.add_argument("--generation_min_new_tokens", type=int, default=1, help="Min new tokens")
     parser.add_argument(
@@ -142,6 +155,43 @@ def parse_args():
         type=str,
         default=None,
         help="Per-device generator max memory map, for example '0:7GiB,1:7GiB,2:7GiB' to reserve cuda:3",
+    )
+    parser.add_argument(
+        "--generation_use_vllm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use vLLM for LM generation/scoring. This switches scoring to vLLM prompt_logprobs.",
+    )
+    parser.add_argument(
+        "--generation_gpu_memory_utilization",
+        type=float,
+        default=0.95,
+        help="vLLM GPU memory utilization when --generation_use_vllm is enabled",
+    )
+    parser.add_argument(
+        "--generation_swap_space",
+        type=float,
+        default=0,
+        help="vLLM CPU swap space in GiB per GPU when --generation_use_vllm is enabled",
+    )
+    parser.add_argument(
+        "--generation_cpu_offload_gb",
+        type=float,
+        default=0,
+        help="vLLM CPU offload size in GiB when --generation_use_vllm is enabled",
+    )
+    parser.add_argument(
+        "--generation_dtype",
+        type=str,
+        default="half",
+        choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+        help="vLLM model dtype when --generation_use_vllm is enabled. Use half/float16 for RTX 2080 Ti.",
+    )
+    parser.add_argument(
+        "--generation_tensor_parallel_size",
+        type=int,
+        default=2,
+        help="vLLM tensor parallel size when --generation_use_vllm is enabled; defaults to all visible GPUs",
     )
     parser.add_argument("--generator_gpu", type=int, default=None, help="Single GPU id for generator")
 
@@ -232,7 +282,12 @@ def parse_args():
     )
     parser.add_argument("--save_freq", type=int, default=10, help="Save retriever every N steps")
     parser.add_argument("--runtime_log_root", type=str, default="./logs/train", help="Runtime log root directory")
-    parser.add_argument("--early_stopping", action="store_true", help="Stop when validation loss stops improving")
+    parser.add_argument(
+        "--early_stopping",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stop when validation loss stops improving",
+    )
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
@@ -379,12 +434,10 @@ def log_hot_storage_paths(runtime_log_path, cfg):
         location = "/docker" if real_path.startswith("/docker/") or real_path == "/docker" else "non-/docker"
         print(f"  {label}: path={path} realpath={real_path} [{location}]")
 
-    if any(
-        not (os.path.realpath(path).startswith("/docker/") or os.path.realpath(path) == "/docker")
-        for path in tracked_paths.values()
-    ):
+    runtime_log_real_path = os.path.realpath(tracked_paths["runtime_log_dir"])
+    if not (runtime_log_real_path.startswith("/docker/") or runtime_log_real_path == "/docker"):
         print(
-            "[warning] Hot write paths are not fully on /docker. "
+            "[warning] Runtime logs are not on /docker. "
             "To avoid NFS-induced D-state hangs, run: bash script/setup_local_hot_data.sh"
         )
 
@@ -693,10 +746,17 @@ def main():
             print(
                 "Generator config: "
                 f"model={cfg.generation_model_name}, "
+                f"use_vllm={args.generation_use_vllm}, "
                 f"device_map={generation_device_map}, "
                 f"generator_gpu={args.generator_gpu}, "
+                f"max_model_len={args.generation_max_model_len or cfg.generation_max_total_tokens}, "
                 f"max_memory_per_gpu={args.generation_max_memory_per_gpu}, "
-                f"max_memory_map={args.generation_max_memory_map}"
+                f"max_memory_map={args.generation_max_memory_map}, "
+                f"gpu_memory_utilization={args.generation_gpu_memory_utilization}, "
+                f"swap_space={args.generation_swap_space}, "
+                f"cpu_offload_gb={args.generation_cpu_offload_gb}, "
+                f"dtype={args.generation_dtype}, "
+                f"tensor_parallel_size={args.generation_tensor_parallel_size or 'all_visible'}"
             )
             print(
                 "Hugging Face auth: "
@@ -716,9 +776,15 @@ def main():
                     model_name=cfg.generation_model_name,
                     batch_size=cfg.generation_max_batch_size,
                     max_total_tokens=cfg.generation_max_total_tokens,
+                    max_model_len=args.generation_max_model_len,
                     max_new_tokens=cfg.generation_max_new_tokens,
                     min_new_tokens=cfg.generation_min_new_tokens,
-                    use_vllm=False,
+                    use_vllm=args.generation_use_vllm,
+                    gpu_memory_utilization=args.generation_gpu_memory_utilization,
+                    swap_space=args.generation_swap_space,
+                    cpu_offload_gb=args.generation_cpu_offload_gb,
+                    dtype=args.generation_dtype,
+                    tensor_parallel_size=args.generation_tensor_parallel_size,
                     gpu=args.generator_gpu,
                     device_map=generation_device_map,
                     max_memory_per_gpu=args.generation_max_memory_per_gpu,

@@ -1,7 +1,26 @@
+import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "5,6")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+import multiprocessing as mp
+
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
+from datetime import datetime
+import sys
+
+import torch
+
 from source.utility.data_utils import (
     load_data_from_jsonl
 )
-from source.pipeline.step.__retrieval import RetrievalStep
+from source.pipeline.step.retrieval import RetrievalStep
 from source.pipeline.step.generation import (
     GenerationStep, 
     AnswerGenerateOutputParser, 
@@ -14,7 +33,6 @@ from source.pipeline.step.end import EndStep
 from source.pipeline.config import PipelineConfig
 from source.pipeline.controller import PipelineController
 from source.pipeline.state import QuestionState
-import os
 from source.utility.system_utils import seed_everything
 from source.utility.data_utils import clean_and_create_dir
 
@@ -37,6 +55,77 @@ from source.evaluation.evaluate import (
 )
 import copy
 
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        self.flush()
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def build_runtime_log_path(runtime_log_root, dataset, running_name):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = running_name or f"infer_{dataset}"
+    return os.path.join(runtime_log_root, dataset, f"{run_name}__{timestamp}", "inference.log")
+
+
+def log_hot_storage_paths(runtime_log_path, cfg):
+    tracked_paths = {
+        "runtime_log_dir": os.path.dirname(runtime_log_path),
+        "prediction_dir": cfg.prediction_file_dir,
+        "database_dir": cfg.database_path,
+    }
+    print("Hot storage layout:")
+    for label, path in tracked_paths.items():
+        real_path = os.path.realpath(path)
+        location = "/docker" if real_path.startswith("/docker/") or real_path == "/docker" else "non-/docker"
+        print(f"  {label}: path={path} realpath={real_path} [{location}]")
+
+
+def ensure_runtime_paths(cfg):
+    required_files = [
+        cfg.data_file_path,
+        cfg.answer_gen_prompt_file_path,
+        cfg.thought_gen_prompt_file_path,
+    ]
+    for path in required_files:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Required file not found: {path}")
+
+    if not os.path.isdir(cfg.database_path):
+        raise FileNotFoundError(f"Database directory not found: {cfg.database_path}")
+
+    database_artifacts = [
+        os.path.join(cfg.database_path, "docstore.db"),
+        os.path.join(cfg.database_path, "index.faiss"),
+        os.path.join(cfg.database_path, "faiss_id_to_docstore_id.pkl"),
+    ]
+    missing_artifacts = [path for path in database_artifacts if not os.path.exists(path)]
+    if missing_artifacts:
+        raise FileNotFoundError("Missing index artifacts:\n" + "\n".join(missing_artifacts))
+
+
+def describe_cuda_environment():
+    print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '(not set)')}")
+    print(f"Visible CUDA device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        for gpu_idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(gpu_idx)
+            total_gib = props.total_memory / (1024 ** 3)
+            print(f"Logical GPU {gpu_idx}: {props.name}, total_memory={total_gib:.2f} GiB")
+
+
 def run(cfg, generator, retriever, indexer):
     clean_and_create_dir(cfg.prediction_file_dir)
     cfg.save()
@@ -45,7 +134,7 @@ def run(cfg, generator, retriever, indexer):
         file_path = cfg.data_file_path,
         ground_truth_file_path=cfg.ground_truth_file_path,
         return_contexts=True,
-        is_demo=opt.demo,
+        is_demo=cfg.demo,
     )
 
     pipeline = [
@@ -108,6 +197,12 @@ def run(cfg, generator, retriever, indexer):
     )
     with open(cfg.official_evaluation_file_path, 'w') as f:
         json.dump(official_evaluation_results, f)
+
+    print(f"Prediction directory: {cfg.prediction_file_dir}")
+    print(f"Prediction JSON: {cfg.prediction_file_path}")
+    print(f"Evaluation JSON: {cfg.evaluation_file_path}")
+    print(f"Official evaluation JSON: {cfg.official_evaluation_file_path}")
+    print(f"[done] official_f1={official_evaluation_results['f1']}")
     
     return official_evaluation_results['f1']
 
@@ -146,6 +241,12 @@ if __name__ == '__main__':
         choices=['hotpotqa', '2wikimultihopqa', 'musique'],
         default='musique',
         help="Dataset name"
+    )
+    parser.add_argument(
+        "--dataset_split",
+        choices=['dev', 'test'],
+        default='test',
+        help="Dataset split for inference"
     )
     parser.add_argument(
         "--prompt_set",
@@ -192,6 +293,12 @@ if __name__ == '__main__':
         help="Maximum total tokens for generation"
     )
     parser.add_argument(
+        "--generation_max_model_len",
+        type=int,
+        default=4096,
+        help="vLLM max_model_len/KV-cache length. Lower this on 11GB GPUs, for example 2048 or 1024."
+    )
+    parser.add_argument(
         "--generation_max_new_tokens",
         type=int,
         default=64,
@@ -202,6 +309,48 @@ if __name__ == '__main__':
         type=int,
         default=1,
         help="Minimum new tokens for generation"
+    )
+    parser.add_argument(
+        "--generation_gpu_memory_utilization",
+        type=float,
+        default=0.95,
+        help="vLLM GPU memory utilization"
+    )
+    parser.add_argument(
+        "--generation_swap_space",
+        type=float,
+        default=0,
+        help="vLLM CPU swap space in GiB per GPU"
+    )
+    parser.add_argument(
+        "--generation_cpu_offload_gb",
+        type=float,
+        default=0,
+        help="vLLM CPU offload size in GiB"
+    )
+    parser.add_argument(
+        "--generation_dtype",
+        type=str,
+        default="half",
+        choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
+        help="vLLM model dtype. Use half/float16 for RTX 2080 Ti because it does not support bfloat16."
+    )
+    parser.add_argument(
+        "--generation_tensor_parallel_size",
+        type=int,
+        default=2,
+        help="vLLM tensor parallel size; defaults to all visible GPUs"
+    )
+    parser.add_argument(
+        "--vllm_worker_multiproc_method",
+        choices=['spawn', 'fork', 'forkserver'],
+        default='spawn',
+        help="vLLM multiprocessing start method; spawn avoids CUDA fork re-init errors"
+    )
+    parser.add_argument(
+        "--disable_vllm",
+        action='store_true',
+        help="Debug fallback: use Hugging Face Transformers instead of vLLM"
     )
 
     # Retrieval
@@ -270,6 +419,18 @@ if __name__ == '__main__':
         action='store_true',
         help="Use FP16 for retrieval"
     )
+    parser.add_argument(
+        "--retriever_device",
+        type=str,
+        default="cuda:0" if torch.cuda.is_available() else "cpu",
+        help="Retriever device, for example cuda:1 or cpu"
+    )
+    parser.add_argument(
+        "--database_path",
+        type=str,
+        default=None,
+        help="Override retrieval DB directory containing docstore.db, index.faiss, and faiss_id_to_docstore_id.pkl"
+    )
 
     # End
     parser.add_argument(
@@ -291,39 +452,116 @@ if __name__ == '__main__':
         action='store_true',
         help="Whether to use Demo"
     )
+    parser.add_argument(
+        "--runtime_log_root",
+        type=str,
+        default="./logs/inference",
+        help="Runtime log root directory"
+    )
 
     opt = parser.parse_args()
 
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = opt.vllm_worker_multiproc_method
+    try:
+        mp.set_start_method(opt.vllm_worker_multiproc_method, force=True)
+    except RuntimeError:
+        pass
+
+    cfg_kwargs = vars(opt).copy()
+    database_path = cfg_kwargs.pop("database_path")
+    runtime_log_root = cfg_kwargs.pop("runtime_log_root")
+    retriever_device = cfg_kwargs.pop("retriever_device")
+    generation_max_model_len = cfg_kwargs.pop("generation_max_model_len")
+    generation_gpu_memory_utilization = cfg_kwargs.pop("generation_gpu_memory_utilization")
+    generation_swap_space = cfg_kwargs.pop("generation_swap_space")
+    generation_cpu_offload_gb = cfg_kwargs.pop("generation_cpu_offload_gb")
+    generation_dtype = cfg_kwargs.pop("generation_dtype")
+    generation_tensor_parallel_size = cfg_kwargs.pop("generation_tensor_parallel_size")
+    cfg_kwargs.pop("vllm_worker_multiproc_method")
+    disable_vllm = cfg_kwargs.pop("disable_vllm")
+
     seed_everything(opt.seed)
-    
-    cfg = PipelineConfig(**opt.__dict__)
+    cfg = PipelineConfig(**cfg_kwargs)
+    if database_path:
+        cfg.database_path_override = database_path
 
-    generator = LlamaGenerator(
-        LlamaGeneratorConfig(
-        model_name=opt.generation_model_name,
-        batch_size=opt.generation_max_batch_size,
-        max_total_tokens=opt.generation_max_total_tokens,
-        max_new_tokens=opt.generation_max_new_tokens,
-        min_new_tokens=opt.generation_min_new_tokens,
-        use_vllm=True,
-        # use_vllm=False,
-        )
-    )
-    retriever = DenseRetriever(
-        DenseRetrieverConfig(
-            query_model_name_or_path=opt.retrieval_query_model_name_or_path,
-            passage_model_name_or_path=opt.retrieval_passage_model_name_or_path,
-            batch_size=opt.retrieval_batch_size,
-            training_strategy=opt.retrieval_training_strategy,
-            use_fp16=opt.retrieval_use_fp16,
-        )
-    )
-    indexer = Indexer.load_local(
-        IndexerConfig(
-            embedding_sz=768,
-            database_path= cfg.database_path
-        )
-    )
+    runtime_log_path = build_runtime_log_path(runtime_log_root, cfg.dataset, cfg.running_name)
+    os.makedirs(os.path.dirname(runtime_log_path), exist_ok=True)
 
-    cfg.dataset_split = 'test'
-    run(cfg, generator, retriever, indexer)
+    with open(runtime_log_path, "a", encoding="utf-8", buffering=1) as log_file:
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
+        try:
+            print(f"Runtime log: {runtime_log_path}")
+            print(f"Run name: {cfg.running_name}")
+            print(f"Dataset: {cfg.dataset}")
+            print(f"Dataset split: {cfg.dataset_split}")
+            print(f"Data file: {cfg.data_file_path}")
+            print(f"Database path: {cfg.database_path}")
+            print(f"Prompt set: {cfg.prompt_set}")
+            print(f"vLLM worker multiprocessing method: {os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}")
+            log_hot_storage_paths(runtime_log_path, cfg)
+            ensure_runtime_paths(cfg)
+            describe_cuda_environment()
+            print(
+                "Generator config: "
+                f"model={cfg.generation_model_name}, "
+                f"use_vllm={not disable_vllm}, "
+                f"max_batch_size={cfg.generation_max_batch_size}, "
+                f"max_total_tokens={cfg.generation_max_total_tokens}, "
+                f"max_model_len={generation_max_model_len or cfg.generation_max_total_tokens}, "
+                f"gpu_memory_utilization={generation_gpu_memory_utilization}, "
+                f"swap_space={generation_swap_space}, "
+                f"cpu_offload_gb={generation_cpu_offload_gb}, "
+                f"dtype={generation_dtype}, "
+                f"tensor_parallel_size={generation_tensor_parallel_size or 'all_visible'}"
+            )
+            print(
+                "Retriever config: "
+                f"model={cfg.retrieval_query_model_name_or_path}, "
+                f"passage_model={cfg.retrieval_passage_model_name_or_path}, "
+                f"device={retriever_device}, "
+                f"fp16={cfg.retrieval_use_fp16}, "
+                f"batch_size={cfg.retrieval_batch_size}"
+            )
+
+            generator = LlamaGenerator(
+                LlamaGeneratorConfig(
+                    model_name=opt.generation_model_name,
+                    batch_size=opt.generation_max_batch_size,
+                    max_total_tokens=opt.generation_max_total_tokens,
+                    max_model_len=generation_max_model_len,
+                    max_new_tokens=opt.generation_max_new_tokens,
+                    min_new_tokens=opt.generation_min_new_tokens,
+                    gpu_memory_utilization=generation_gpu_memory_utilization,
+                    swap_space=generation_swap_space,
+                    cpu_offload_gb=generation_cpu_offload_gb,
+                    dtype=generation_dtype,
+                    use_vllm=not disable_vllm,
+                    tensor_parallel_size=generation_tensor_parallel_size,
+                )
+            )
+            retriever = DenseRetriever(
+                DenseRetrieverConfig(
+                    query_model_name_or_path=opt.retrieval_query_model_name_or_path,
+                    passage_model_name_or_path=opt.retrieval_passage_model_name_or_path,
+                    batch_size=opt.retrieval_batch_size,
+                    training_strategy=opt.retrieval_training_strategy,
+                    use_fp16=opt.retrieval_use_fp16,
+                    device=retriever_device,
+                )
+            )
+            indexer = Indexer.load_local(
+                IndexerConfig(
+                    embedding_sz=768,
+                    database_path=cfg.database_path
+                )
+            )
+
+            run(cfg, generator, retriever, indexer)
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
