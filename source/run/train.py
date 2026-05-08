@@ -1,17 +1,21 @@
 import os
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "5,6")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import argparse
 import copy
+import json
 import multiprocessing as mp
 import sys
-from dataclasses import fields
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field, fields
 from datetime import datetime
-from typing import List
+from math import exp
+from typing import Any, Dict, List, Literal, Optional
 
 try:
     mp.set_start_method("spawn", force=True)
@@ -23,6 +27,7 @@ import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer
 
 from source.utility.data_utils import clean_and_create_dir, load_data_from_jsonl
 from source.pipeline.config import PipelineConfig
@@ -38,6 +43,7 @@ from source.pipeline.step.generation import (
     ThoughtGeneratePromptGenerator,
 )
 from source.pipeline.step.end import EndStep
+from source.module.generate.base import BaseGenerator, BaseGeneratorConfig
 from source.module.generate.llama import LlamaGenerator, LlamaGeneratorConfig
 from source.module.retrieve.dense import DenseRetriever, DenseRetrieverConfig
 from source.module.index.index import Indexer, IndexerConfig
@@ -74,6 +80,354 @@ class TeeStream:
 
     def isatty(self):
         return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+@dataclass
+class VLLMServerGeneratorConfig(BaseGeneratorConfig):
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    served_model_name: Optional[str] = None
+    base_url: str = "http://127.0.0.1:8000/v1"
+    max_total_tokens: int = 4096
+    score_max_tokens: int = 1024
+    max_new_tokens: int = 64
+    min_new_tokens: int = 1
+    temperature: float = 0.0
+    repetition_penalty: float = 1.0
+    stop: List[str] = field(default_factory=list)
+    include_stop_str_in_output: bool = True
+    request_timeout: float = 600.0
+    scoring_mode: str = "prompt_logprobs"
+    prompt_logprobs: int = 20
+    missing_logprob_fallback: float = -20.0
+
+
+class VLLMServerGenerator(BaseGenerator):
+    """Generator client for a persistent vLLM OpenAI-compatible server."""
+
+    def __init__(self, cfg: VLLMServerGeneratorConfig):
+        super().__init__(cfg)
+        self.base_url = cfg.base_url.rstrip("/")
+        self.model = cfg.served_model_name or cfg.model_name
+        self.hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model_name,
+            token=self.hf_token,
+        )
+        self.tokenizer.padding_side = "left"
+        self._warned_score_fallback = False
+        self._health_check_completion()
+
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.cfg.request_timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            payload_summary = self._summarize_payload(payload)
+            print(
+                "[vllm-server-error] "
+                f"url={url} status={error.code} reason={error.reason} "
+                f"payload={payload_summary}",
+                file=sys.stderr,
+            )
+            if body:
+                print(
+                    "[vllm-server-error-body] "
+                    f"{body[:4000]}",
+                    file=sys.stderr,
+                )
+            raise RuntimeError(f"vLLM server request failed: {error.code} {body}") from error
+        except urllib.error.URLError as error:
+            print(
+                "[vllm-server-error] "
+                f"url={url} connection_error={error}",
+                file=sys.stderr,
+            )
+            raise RuntimeError(
+                f"Cannot connect to vLLM server at {self.base_url}. "
+                "Start it first with script/preload_vllm_server.py."
+            ) from error
+
+    def _summarize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = payload.get("prompt")
+        if isinstance(prompt, list):
+            prompt_count = len(prompt)
+            prompt_chars = sum(len(str(item)) for item in prompt)
+            prompt_tokens = sum(
+                len(self.tokenizer.encode(str(item), add_special_tokens=False))
+                for item in prompt[: min(4, len(prompt))]
+            )
+            prompt_tokens_estimate = (
+                int(prompt_tokens * prompt_count / min(4, prompt_count))
+                if prompt_count > 0
+                else 0
+            )
+        elif prompt is None:
+            prompt_count = 0
+            prompt_chars = 0
+            prompt_tokens_estimate = 0
+        else:
+            prompt_count = 1
+            prompt_chars = len(str(prompt))
+            prompt_tokens_estimate = len(
+                self.tokenizer.encode(str(prompt), add_special_tokens=False)
+            )
+
+        return {
+            "model": payload.get("model"),
+            "prompt_count": prompt_count,
+            "prompt_chars": prompt_chars,
+            "prompt_tokens_estimate": prompt_tokens_estimate,
+            "max_tokens": payload.get("max_tokens"),
+            "logprobs": payload.get("logprobs"),
+            "prompt_logprobs": payload.get("prompt_logprobs"),
+            "echo": payload.get("echo"),
+        }
+
+    def _health_check_completion(self):
+        payload = {
+            "model": self.model,
+            "prompt": "health check",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        try:
+            self._post_json("/completions", payload)
+        except RuntimeError as error:
+            raise RuntimeError(
+                "vLLM server is reachable but cannot complete a minimal request. "
+                "Restart the preloaded server with a smaller max_model_len, lower "
+                "gpu_memory_utilization, or --enforce_eager. "
+                f"Original error: {error}"
+            ) from error
+
+    @staticmethod
+    def _choice_texts_by_index(response: Dict[str, Any], expected_count: int) -> List[str]:
+        outputs = [""] * expected_count
+        for fallback_idx, choice in enumerate(response.get("choices", [])):
+            index = int(choice.get("index", fallback_idx))
+            if 0 <= index < expected_count:
+                outputs[index] = choice.get("text", "")
+        return outputs
+
+    @staticmethod
+    def _extract_logprob(logprob_entry: Any) -> float:
+        if isinstance(logprob_entry, dict):
+            if "logprob" in logprob_entry:
+                return float(logprob_entry["logprob"])
+            if "log_prob" in logprob_entry:
+                return float(logprob_entry["log_prob"])
+        return float(logprob_entry)
+
+    def _generate(self, inputs: List[str]) -> List[str]:
+        stop = [self.tokenizer.eos_token, "<|eot_id|>"] + list(self.cfg.stop)
+        stop = [item for item in stop if item]
+        max_prompt_tokens = max(
+            1,
+            int(self.cfg.max_total_tokens) - int(self.cfg.max_new_tokens),
+        )
+        truncated_inputs = [
+            self.tokenizer.decode(
+                self.tokenizer.encode(
+                    input_text,
+                    max_length=max_prompt_tokens,
+                    truncation=True,
+                    add_special_tokens=False,
+                ),
+                skip_special_tokens=False,
+            )
+            for input_text in inputs
+        ]
+        payload = {
+            "model": self.model,
+            "prompt": truncated_inputs,
+            "n": 1,
+            "max_tokens": self.cfg.max_new_tokens,
+            "temperature": self.cfg.temperature,
+            "stop": stop,
+            "stream": False,
+        }
+        response = self._post_json("/completions", payload)
+        return self._choice_texts_by_index(response, len(inputs))
+
+    def _score_with_prompt_logprobs(
+        self,
+        input_texts: List[str],
+        output_texts: List[str],
+    ) -> List[float]:
+        combined_texts = []
+        answer_token_ids = []
+        answer_offsets = []
+        max_prompt_tokens = max(2, int(self.cfg.score_max_tokens) - 1)
+
+        for input_text, output_text in zip(input_texts, output_texts):
+            cur_answer_ids = self.tokenizer.encode(output_text, add_special_tokens=False)
+            if not cur_answer_ids:
+                cur_answer_ids = [self.tokenizer.eos_token_id]
+
+            cur_answer_ids = cur_answer_ids[: max(1, max_prompt_tokens - 1)]
+            max_input_tokens = max(1, max_prompt_tokens - len(cur_answer_ids))
+            cur_input_ids = self.tokenizer.encode(
+                input_text,
+                max_length=max_input_tokens,
+                truncation=True,
+                add_special_tokens=False,
+            )
+            if not cur_input_ids:
+                cur_input_ids = [self.tokenizer.eos_token_id]
+
+            answer_offsets.append(len(cur_input_ids))
+            answer_token_ids.append(cur_answer_ids)
+            combined_texts.append(
+                self.tokenizer.decode(
+                    cur_input_ids + cur_answer_ids,
+                    skip_special_tokens=False,
+                )
+            )
+
+        payload = {
+            "model": self.model,
+            "prompt": combined_texts,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "prompt_logprobs": self.cfg.prompt_logprobs,
+            "stream": False,
+        }
+        response = self._post_json("/completions", payload)
+
+        choices = sorted(response.get("choices", []), key=lambda choice: int(choice.get("index", 0)))
+        if len(choices) < len(combined_texts):
+            raise RuntimeError("vLLM server returned fewer scoring choices than requested.")
+
+        perplexities = []
+        for request_idx, choice in enumerate(choices[: len(combined_texts)]):
+            prompt_logprobs = choice.get("prompt_logprobs")
+            if not prompt_logprobs:
+                raise RuntimeError("vLLM server response does not contain prompt_logprobs.")
+
+            token_logprobs = []
+            for token_offset, token_id in enumerate(answer_token_ids[request_idx]):
+                position = answer_offsets[request_idx] + token_offset
+                if position >= len(prompt_logprobs):
+                    raise RuntimeError("vLLM server returned incomplete prompt_logprobs.")
+                candidates = prompt_logprobs[position] or {}
+                logprob_entry = candidates.get(str(token_id))
+                if logprob_entry is None:
+                    logprob_entry = candidates.get(token_id)
+                if logprob_entry is None:
+                    if not self._warned_score_fallback:
+                        decoded_token = self.tokenizer.decode([token_id])
+                        print(
+                            "[vllm-server-warning] Target token missing from "
+                            "prompt_logprobs; using fallback logprob. "
+                            f"token_id={token_id} decoded={decoded_token!r} "
+                            f"prompt_logprobs={self.cfg.prompt_logprobs} "
+                            f"fallback={self.cfg.missing_logprob_fallback}",
+                            file=sys.stderr,
+                        )
+                        self._warned_score_fallback = True
+                    token_logprobs.append(float(self.cfg.missing_logprob_fallback))
+                else:
+                    token_logprobs.append(self._extract_logprob(logprob_entry))
+
+            mean_negative_logprob = -sum(token_logprobs) / max(1, len(token_logprobs))
+            perplexities.append(exp(mean_negative_logprob))
+
+        return perplexities
+
+    def _score_with_echo_logprobs(
+        self,
+        input_texts: List[str],
+        output_texts: List[str],
+    ) -> List[float]:
+        combined_texts = []
+        input_token_lengths = []
+        answer_token_lengths = []
+        max_prompt_tokens = max(2, int(self.cfg.score_max_tokens) - 1)
+
+        for input_text, output_text in zip(input_texts, output_texts):
+            answer_ids = self.tokenizer.encode(output_text, add_special_tokens=False)
+            if not answer_ids:
+                answer_ids = [self.tokenizer.eos_token_id]
+            answer_ids = answer_ids[: max(1, max_prompt_tokens - 1)]
+
+            max_input_tokens = max(1, max_prompt_tokens - len(answer_ids))
+            input_ids = self.tokenizer.encode(
+                input_text,
+                max_length=max_input_tokens,
+                truncation=True,
+                add_special_tokens=False,
+            )
+            if not input_ids:
+                input_ids = [self.tokenizer.eos_token_id]
+
+            combined_texts.append(
+                self.tokenizer.decode(
+                    input_ids + answer_ids,
+                    skip_special_tokens=False,
+                )
+            )
+            input_token_lengths.append(len(input_ids))
+            answer_token_lengths.append(len(answer_ids))
+        payload = {
+            "model": self.model,
+            "prompt": combined_texts,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "echo": True,
+            "stream": False,
+        }
+        response = self._post_json("/completions", payload)
+        choices = sorted(response.get("choices", []), key=lambda choice: int(choice.get("index", 0)))
+
+        perplexities = []
+        for request_idx, choice in enumerate(choices[: len(combined_texts)]):
+            logprobs = choice.get("logprobs") or {}
+            token_logprobs = logprobs.get("token_logprobs") or []
+            text_offsets = logprobs.get("text_offset") or []
+            answer_char_start = len(input_texts[request_idx])
+
+            if text_offsets and len(text_offsets) == len(token_logprobs):
+                selected = [
+                    value for value, offset in zip(token_logprobs, text_offsets)
+                    if value is not None and offset >= answer_char_start
+                ]
+            else:
+                start = input_token_lengths[request_idx]
+                end = start + answer_token_lengths[request_idx]
+                selected = [
+                    value for value in token_logprobs[start:end]
+                    if value is not None
+                ]
+            if not selected:
+                raise RuntimeError("vLLM echo logprobs did not contain answer token scores.")
+            mean_negative_logprob = -sum(float(value) for value in selected) / len(selected)
+            perplexities.append(exp(mean_negative_logprob))
+
+        if len(perplexities) != len(combined_texts):
+            raise RuntimeError("vLLM server returned fewer echo-logprob scores than requested.")
+        return perplexities
+
+    def _score(
+        self,
+        input_texts: List[str],
+        output_texts: List[str],
+        method: Literal["perplexity_score"] = "perplexity_score",
+    ) -> List[float]:
+        if self.cfg.scoring_mode == "prompt_logprobs":
+            return self._score_with_prompt_logprobs(input_texts, output_texts)
+        if self.cfg.scoring_mode == "echo_logprobs":
+            return self._score_with_echo_logprobs(input_texts, output_texts)
+        raise ValueError(f"Unsupported vLLM server scoring mode: {self.cfg.scoring_mode}")
 
 
 def parse_args():
@@ -117,6 +471,54 @@ def parse_args():
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="Generation model",
+    )
+    parser.add_argument(
+        "--generation_backend",
+        choices=["vllm_server", "local"],
+        default="vllm_server",
+        help="Use a persistent vLLM server client or load the generator locally in this process.",
+    )
+    parser.add_argument(
+        "--vllm_server_url",
+        type=str,
+        default="http://127.0.0.1:8000/v1",
+        help="OpenAI-compatible vLLM server base URL used when generation_backend=vllm_server.",
+    )
+    parser.add_argument(
+        "--vllm_server_model",
+        type=str,
+        default=None,
+        help="Served model name exposed by the vLLM server; defaults to generation_model_name.",
+    )
+    parser.add_argument(
+        "--vllm_server_timeout",
+        type=float,
+        default=600.0,
+        help="HTTP request timeout in seconds for the vLLM server client.",
+    )
+    parser.add_argument(
+        "--vllm_server_score_max_tokens",
+        type=int,
+        default=1024,
+        help="Max tokens used by vLLM-server scoring requests. Lower this to avoid logprobs OOM.",
+    )
+    parser.add_argument(
+        "--vllm_server_scoring_mode",
+        choices=["prompt_logprobs", "echo_logprobs"],
+        default="prompt_logprobs",
+        help="Scoring API mode for the external vLLM server.",
+    )
+    parser.add_argument(
+        "--vllm_server_prompt_logprobs",
+        type=int,
+        default=20,
+        help="Top-k prompt logprobs requested from vLLM server scoring.",
+    )
+    parser.add_argument(
+        "--vllm_server_missing_logprob_fallback",
+        type=float,
+        default=-20.0,
+        help="Fallback logprob when a target token is outside returned prompt_logprobs top-k.",
     )
     parser.add_argument(
         "--generation_max_batch_size",
@@ -266,7 +668,7 @@ def parse_args():
     )
     parser.add_argument("--wandb_key", type=str, default=None, help="WandB API key")
 
-    parser.add_argument("--num_workers", type=int, default=256, help="DataLoader workers")
+    parser.add_argument("--num_workers", type=int, default=40, help="DataLoader workers")
     parser.add_argument("--validation_freq", type=int, default=10, help="Run validation every N steps")
     parser.add_argument(
         "--validation_batch_size",
@@ -743,21 +1145,36 @@ def main():
             generation_device_map = None if args.generator_gpu is not None else args.generation_device_map
             retriever_device = resolve_retriever_device(args.retriever_device)
 
-            print(
-                "Generator config: "
-                f"model={cfg.generation_model_name}, "
-                f"use_vllm={args.generation_use_vllm}, "
-                f"device_map={generation_device_map}, "
-                f"generator_gpu={args.generator_gpu}, "
-                f"max_model_len={args.generation_max_model_len or cfg.generation_max_total_tokens}, "
-                f"max_memory_per_gpu={args.generation_max_memory_per_gpu}, "
-                f"max_memory_map={args.generation_max_memory_map}, "
-                f"gpu_memory_utilization={args.generation_gpu_memory_utilization}, "
-                f"swap_space={args.generation_swap_space}, "
-                f"cpu_offload_gb={args.generation_cpu_offload_gb}, "
-                f"dtype={args.generation_dtype}, "
-                f"tensor_parallel_size={args.generation_tensor_parallel_size or 'all_visible'}"
-            )
+            if args.generation_backend == "vllm_server":
+                print(
+                    "Generator config: "
+                    f"backend={args.generation_backend}, "
+                    f"model={cfg.generation_model_name}, "
+                    f"url={args.vllm_server_url}, "
+                    f"served_model={args.vllm_server_model or cfg.generation_model_name}, "
+                    f"score_max_tokens={args.vllm_server_score_max_tokens}, "
+                    f"scoring_mode={args.vllm_server_scoring_mode}, "
+                    f"prompt_logprobs={args.vllm_server_prompt_logprobs}, "
+                    f"request_timeout={args.vllm_server_timeout}, "
+                    "local_vllm_load=False"
+                )
+            else:
+                print(
+                    "Generator config: "
+                    f"backend={args.generation_backend}, "
+                    f"model={cfg.generation_model_name}, "
+                    f"use_vllm={args.generation_use_vllm}, "
+                    f"device_map={generation_device_map}, "
+                    f"generator_gpu={args.generator_gpu}, "
+                    f"max_model_len={args.generation_max_model_len or cfg.generation_max_total_tokens}, "
+                    f"max_memory_per_gpu={args.generation_max_memory_per_gpu}, "
+                    f"max_memory_map={args.generation_max_memory_map}, "
+                    f"gpu_memory_utilization={args.generation_gpu_memory_utilization}, "
+                    f"swap_space={args.generation_swap_space}, "
+                    f"cpu_offload_gb={args.generation_cpu_offload_gb}, "
+                    f"dtype={args.generation_dtype}, "
+                    f"tensor_parallel_size={args.generation_tensor_parallel_size or 'all_visible'}"
+                )
             print(
                 "Hugging Face auth: "
                 f"HF_HOME={os.environ.get('HF_HOME', '(default)')}, "
@@ -771,26 +1188,44 @@ def main():
                 f"fp16={cfg.retrieval_use_fp16}"
             )
 
-            generator = LlamaGenerator(
-                LlamaGeneratorConfig(
-                    model_name=cfg.generation_model_name,
-                    batch_size=cfg.generation_max_batch_size,
-                    max_total_tokens=cfg.generation_max_total_tokens,
-                    max_model_len=args.generation_max_model_len,
-                    max_new_tokens=cfg.generation_max_new_tokens,
-                    min_new_tokens=cfg.generation_min_new_tokens,
-                    use_vllm=args.generation_use_vllm,
-                    gpu_memory_utilization=args.generation_gpu_memory_utilization,
-                    swap_space=args.generation_swap_space,
-                    cpu_offload_gb=args.generation_cpu_offload_gb,
-                    dtype=args.generation_dtype,
-                    tensor_parallel_size=args.generation_tensor_parallel_size,
-                    gpu=args.generator_gpu,
-                    device_map=generation_device_map,
-                    max_memory_per_gpu=args.generation_max_memory_per_gpu,
-                    max_memory_map=args.generation_max_memory_map,
+            if args.generation_backend == "vllm_server":
+                generator = VLLMServerGenerator(
+                    VLLMServerGeneratorConfig(
+                        model_name=cfg.generation_model_name,
+                        served_model_name=args.vllm_server_model,
+                        base_url=args.vllm_server_url,
+                        batch_size=cfg.generation_max_batch_size,
+                        max_total_tokens=cfg.generation_max_total_tokens,
+                        score_max_tokens=args.vllm_server_score_max_tokens,
+                        max_new_tokens=cfg.generation_max_new_tokens,
+                        min_new_tokens=cfg.generation_min_new_tokens,
+                        request_timeout=args.vllm_server_timeout,
+                        scoring_mode=args.vllm_server_scoring_mode,
+                        prompt_logprobs=args.vllm_server_prompt_logprobs,
+                        missing_logprob_fallback=args.vllm_server_missing_logprob_fallback,
+                    )
                 )
-            )
+            else:
+                generator = LlamaGenerator(
+                    LlamaGeneratorConfig(
+                        model_name=cfg.generation_model_name,
+                        batch_size=cfg.generation_max_batch_size,
+                        max_total_tokens=cfg.generation_max_total_tokens,
+                        max_model_len=args.generation_max_model_len,
+                        max_new_tokens=cfg.generation_max_new_tokens,
+                        min_new_tokens=cfg.generation_min_new_tokens,
+                        use_vllm=args.generation_use_vllm,
+                        gpu_memory_utilization=args.generation_gpu_memory_utilization,
+                        swap_space=args.generation_swap_space,
+                        cpu_offload_gb=args.generation_cpu_offload_gb,
+                        dtype=args.generation_dtype,
+                        tensor_parallel_size=args.generation_tensor_parallel_size,
+                        gpu=args.generator_gpu,
+                        device_map=generation_device_map,
+                        max_memory_per_gpu=args.generation_max_memory_per_gpu,
+                        max_memory_map=args.generation_max_memory_map,
+                    )
+                )
             retriever = DenseRetriever(
                 DenseRetrieverConfig(
                     query_model_name_or_path=cfg.retrieval_query_model_name_or_path,
