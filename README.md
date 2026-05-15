@@ -108,25 +108,24 @@ data/processed_data/<dataset>/
 
 ## vLLM Server
 
-Training can use a persistent vLLM server so the Llama model is loaded once and reused across runs. This avoids repeatedly loading the LLM inside `train.py`.
+Training uses a persistent vLLM server so the Llama model is loaded once and reused across runs. This avoids repeatedly loading the LLM inside `train.py`.
 
 Recommended GPU split:
 
 - GPU `1`: retriever training
 - GPU `5,6`: vLLM server for Llama generation/scoring
 
-Start vLLM first:
+Start vLLM before training:
 
 ```bash
-/mmlab_students/storageStudents/nguyenvd/anaconda3/envs/ReSCORE/bin/python \
-  script/preload_vllm_server.py \
+python script/preload_vllm_server.py \
   --cuda_visible_devices 5,6 \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --tensor_parallel_size 2 \
   --dtype half \
   --gpu_memory_utilization 0.9 \
   --max_model_len 4096 \
-  --max_num_seqs 10 \
+  --max_num_seqs 20 \
   --swap_space 0 \
   --cpu_offload_gb 0 \
   --enforce_eager \
@@ -149,30 +148,35 @@ Main entry point:
 python -m source.run.train
 ```
 
-The recommended reproduction command for `2wikimultihopqa` uses GPU `1` for the retriever and the already-running vLLM server on GPU `5,6`:
+Use the same ReSCORE training template for all three datasets. Set `DATASET` to one of:
+
+```text
+hotpotqa
+2wikimultihopqa
+musique
+```
+
+Then run:
 
 ```bash
+DATASET=2wikimultihopqa
+RUNNING_NAME=train_${DATASET}_vllm_server_from_scratch
+
 CUDA_VISIBLE_DEVICES=1 python -m source.run.train \
-  --running_name train_2wiki_vllm_server_from_scratch \
-  --dataset 2wikimultihopqa \
+  --running_name "${RUNNING_NAME}" \
+  --dataset "${DATASET}" \
   --method rescore \
   --prompt_set 1 \
   --retrieval_query_model_name_or_path facebook/contriever-msmarco \
   --retrieval_passage_model_name_or_path facebook/contriever-msmarco \
   --retriever_device cuda:0 \
-  --retrieval_batch_size 256 \
-  --retrieval_buffer_size 32 \
-  --retrieval_count 8 \
   --generation_backend vllm_server \
   --vllm_server_url http://127.0.0.1:8000/v1 \
   --vllm_server_scoring_mode prompt_logprobs \
   --vllm_server_score_max_tokens 256 \
-  --vllm_server_prompt_logprobs 1 \
-  --vllm_server_missing_logprob_fallback -20.0 \
+  --num_workers 40 \
   --generation_max_total_tokens 4096 \
   --generation_max_new_tokens 64 \
-  --generation_max_batch_size 1 \
-  --num_workers 40 \
   --early_stopping \
   --early_stopping_patience 5 \
   --early_stopping_min_delta 1e-4 \
@@ -182,7 +186,17 @@ CUDA_VISIBLE_DEVICES=1 python -m source.run.train \
   --save_freq 500
 ```
 
-In this command, `cuda:0` refers to logical GPU `0` inside the training process. Because `CUDA_VISIBLE_DEVICES=1`, it maps to physical GPU `1`.
+Dataset presets:
+
+| Dataset | `DATASET` | `RUNNING_NAME` |
+| --- | --- | --- |
+| HotpotQA | `hotpotqa` | `train_hotpotqa_vllm_server_from_scratch` |
+| 2WikiMultiHopQA | `2wikimultihopqa` | `train_2wiki_vllm_server_from_scratch` |
+| MuSiQue | `musique` | `train_musique_vllm_server_from_scratch` |
+
+Choose one row, set `DATASET` and `RUNNING_NAME`, then run the training template above.
+
+In this setup, `cuda:0` refers to logical GPU `0` inside the training process. Because `CUDA_VISIBLE_DEVICES=1`, it maps to physical GPU `1`. The Llama model is not loaded by `train.py`; it is served by the vLLM process already running on physical GPUs `5,6`.
 
 Training logs:
 
@@ -204,16 +218,19 @@ Main entry point:
 python -m source.run.inference
 ```
 
-Example MuSiQue inference command with a local retriever checkpoint:
+Use a trained retriever checkpoint from `predictions/<dataset>/...`:
 
 ```bash
+DATASET=musique
+CHECKPOINT_PATH=./predictions/musique/<run_name>/<checkpoint_dir>
+
 CUDA_VISIBLE_DEVICES=5,6 python -m source.run.inference \
   --method rescore \
-  --running_name infer_musique_best \
-  --dataset musique \
+  --running_name "infer_${DATASET}_best" \
+  --dataset "${DATASET}" \
   --dataset_split test \
   --prompt_set 1 \
-  --retrieval_query_model_name_or_path ./predictions/musique/train_musique_resume_best___llama_3.1_8b_instruct___best_validation/multi_retrieval___train/prompt_set__1/retr_count__4/epoch_0_step_690 \
+  --retrieval_query_model_name_or_path "${CHECKPOINT_PATH}" \
   --retrieval_passage_model_name_or_path facebook/contriever-msmarco \
   --retriever_device cuda:0
 ```
