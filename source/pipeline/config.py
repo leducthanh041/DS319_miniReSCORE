@@ -101,6 +101,7 @@ class PipelineConfig:
     temperature_lm: float = 1.
     gradient_accumulation_steps: int = 1
     wandb_key: Optional[str] = None
+    prediction_root_override: Optional[str] = None
 
     def __post_init__(self):
         seed_everything(self.seed)
@@ -145,10 +146,9 @@ class PipelineConfig:
 
     @property
     def prediction_file_dir(self):
-        
+        prediction_root = self.prediction_root_override or os.path.join('./', 'predictions')
         prediction_file_directory_arr = [
-            './', 
-            'predictions', 
+            prediction_root,
             f"{self.dataset}",
             '___'.join(clean_arr([
                 self.running_name,

@@ -115,6 +115,7 @@ class VLLMServerGenerator(BaseGenerator):
         )
         self.tokenizer.padding_side = "left"
         self._warned_score_fallback = False
+        self._warned_incomplete_prompt_logprobs = False
         self._health_check_completion()
 
     def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -317,7 +318,19 @@ class VLLMServerGenerator(BaseGenerator):
             for token_offset, token_id in enumerate(answer_token_ids[request_idx]):
                 position = answer_offsets[request_idx] + token_offset
                 if position >= len(prompt_logprobs):
-                    raise RuntimeError("vLLM server returned incomplete prompt_logprobs.")
+                    if not self._warned_incomplete_prompt_logprobs:
+                        print(
+                            "[vllm-server-warning] vLLM server returned incomplete "
+                            "prompt_logprobs; using fallback logprob for missing "
+                            "answer-token positions. "
+                            f"expected_position={position} "
+                            f"returned_positions={len(prompt_logprobs)} "
+                            f"fallback={self.cfg.missing_logprob_fallback}",
+                            file=sys.stderr,
+                        )
+                        self._warned_incomplete_prompt_logprobs = True
+                    token_logprobs.append(float(self.cfg.missing_logprob_fallback))
+                    continue
                 candidates = prompt_logprobs[position] or {}
                 logprob_entry = candidates.get(str(token_id))
                 if logprob_entry is None:
@@ -685,6 +698,12 @@ def parse_args():
     parser.add_argument("--save_freq", type=int, default=10, help="Save retriever every N steps")
     parser.add_argument("--runtime_log_root", type=str, default="./logs/train", help="Runtime log root directory")
     parser.add_argument(
+        "--prediction_root",
+        type=str,
+        default=None,
+        help="Override root directory for predictions/checkpoints, for example /docker/data/$USER/ReSCORE/predictions.",
+    )
+    parser.add_argument(
         "--early_stopping",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -702,6 +721,12 @@ def parse_args():
         default=1e-4,
         help="Minimum validation loss improvement to reset early-stopping patience",
     )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=0,
+        help="Stop this run after N training batches; <=0 means no explicit step limit.",
+    )
 
     return parser.parse_args()
 
@@ -714,6 +739,8 @@ def build_pipeline_config(args):
     }
     if args.database_path:
         cfg_kwargs["database_path_override"] = args.database_path
+    if args.prediction_root:
+        cfg_kwargs["prediction_root_override"] = args.prediction_root
     cfg_kwargs["train"] = True
     if not cfg_kwargs.get("running_name"):
         cfg_kwargs["running_name"] = f"train_{cfg_kwargs['dataset']}"
@@ -990,8 +1017,11 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
     best_val_loss = float("inf")
     bad_validation_count = 0
     should_stop = False
+    global_steps_this_run = 0
     if args.early_stopping and args.validation_freq <= 0:
         print("[early-stopping] disabled because validation_freq <= 0")
+    if args.max_train_steps > 0:
+        print(f"[max-train-steps] enabled max_train_steps={args.max_train_steps}")
 
     for epoch in range(cfg.n_epochs):
         num_steps = 0
@@ -999,6 +1029,7 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
 
         for batch in dataloader:
             num_steps += 1
+            global_steps_this_run += 1
             batch_loss = controller.train(batch)
             loss_value = batch_loss.item()
             batch_loss.backward()
@@ -1090,10 +1121,24 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
             if num_steps % 20 == 0:
                 safe_cuda_empty_cache(f"train epoch={epoch} step={num_steps}")
 
+            if args.max_train_steps > 0 and global_steps_this_run >= args.max_train_steps:
+                print(
+                    f"[max-train-steps] stopping at epoch={epoch} "
+                    f"step={num_steps} run_step={global_steps_this_run}"
+                )
+                should_stop = True
+                break
+
         if should_stop:
-            optimizer.zero_grad(set_to_none=True)
-            num_accumulations = 0
-            print(f"[epoch-end] epoch={epoch} stopped_early=True optimizer_steps={optimizer_steps}")
+            if num_accumulations > 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+                num_accumulations = 0
+                print(f"[optimizer] flushed trailing gradients before stop at epoch={epoch}")
+            else:
+                optimizer.zero_grad(set_to_none=True)
+            print(f"[epoch-end] epoch={epoch} stopped=True optimizer_steps={optimizer_steps}")
             break
 
         if num_accumulations > 0:

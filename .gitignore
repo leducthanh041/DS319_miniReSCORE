@@ -52,6 +52,7 @@ embeddings/
 
 # Model checkpoints and predictions
 predictions/
+predictions
 predictions_docker_link
 checkpoints/
 checkpoint*/
