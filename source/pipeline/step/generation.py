@@ -111,10 +111,15 @@ class AnswerGenerateOutputParser(BaseOutputParser):
         generated_text = generated_text.strip()
         try:
             data = json.loads(generated_text)
-            if "answer" in data:
+            if isinstance(data, dict) and "answer" in data:
                 return AnswerState(
                     parent_state_id=last_state_id,
                     answer=str(data["answer"])
+                )
+            if isinstance(data, (str, int, float, bool)):
+                return AnswerState(
+                    parent_state_id=last_state_id,
+                    answer=str(data)
                 )
             else:
                 return AnswerState(
@@ -140,10 +145,15 @@ class ThoughtGenerateOutputParser(BaseOutputParser):
         generated_text = generated_text.strip()
         try:
             data = json.loads(generated_text)
-            if "thought" in data:
+            if isinstance(data, dict) and "thought" in data:
                 return ThoughtState(
                     parent_state_id=last_state_id,
                     thought=str(data["thought"])
+                )
+            if isinstance(data, (str, int, float, bool)):
+                return ThoughtState(
+                    parent_state_id=last_state_id,
+                    thought=str(data)
                 )
             else:
                 return ThoughtState(

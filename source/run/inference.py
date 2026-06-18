@@ -40,6 +40,10 @@ from source.module.generate.llama import (
     LlamaGenerator,
     LlamaGeneratorConfig
 )
+from source.module.generate.vllm_server import (
+    VLLMServerGenerator,
+    VLLMServerGeneratorConfig,
+)
 from source.module.retrieve.dense import (
     DenseRetriever,
     DenseRetrieverConfig
@@ -281,6 +285,30 @@ if __name__ == '__main__':
         help="Generation model name"
     )
     parser.add_argument(
+        "--generation_backend",
+        choices=["local", "vllm_server"],
+        default="local",
+        help="Use local in-process generator or an already running OpenAI-compatible vLLM server."
+    )
+    parser.add_argument(
+        "--vllm_server_url",
+        type=str,
+        default="http://127.0.0.1:8000/v1",
+        help="OpenAI-compatible vLLM server base URL when generation_backend=vllm_server."
+    )
+    parser.add_argument(
+        "--vllm_server_model",
+        type=str,
+        default=None,
+        help="Served model name exposed by vLLM server; defaults to generation_model_name."
+    )
+    parser.add_argument(
+        "--vllm_server_timeout",
+        type=float,
+        default=600.0,
+        help="HTTP request timeout in seconds when generation_backend=vllm_server."
+    )
+    parser.add_argument(
         "--generation_max_batch_size",
         type=int,
         default=4,
@@ -327,6 +355,16 @@ if __name__ == '__main__':
         type=float,
         default=0,
         help="vLLM CPU offload size in GiB"
+    )
+    parser.add_argument(
+        "--generation_enforce_eager",
+        action="store_true",
+        help="Disable vLLM CUDA graph capture. Safer on 11GB GPUs and after NCCL/CUDA instability."
+    )
+    parser.add_argument(
+        "--generation_disable_custom_all_reduce",
+        action="store_true",
+        help="Disable vLLM custom all-reduce for tensor parallel inference."
     )
     parser.add_argument(
         "--generation_dtype",
@@ -471,10 +509,16 @@ if __name__ == '__main__':
     database_path = cfg_kwargs.pop("database_path")
     runtime_log_root = cfg_kwargs.pop("runtime_log_root")
     retriever_device = cfg_kwargs.pop("retriever_device")
+    generation_backend = cfg_kwargs.pop("generation_backend")
+    vllm_server_url = cfg_kwargs.pop("vllm_server_url")
+    vllm_server_model = cfg_kwargs.pop("vllm_server_model")
+    vllm_server_timeout = cfg_kwargs.pop("vllm_server_timeout")
     generation_max_model_len = cfg_kwargs.pop("generation_max_model_len")
     generation_gpu_memory_utilization = cfg_kwargs.pop("generation_gpu_memory_utilization")
     generation_swap_space = cfg_kwargs.pop("generation_swap_space")
     generation_cpu_offload_gb = cfg_kwargs.pop("generation_cpu_offload_gb")
+    generation_enforce_eager = cfg_kwargs.pop("generation_enforce_eager")
+    generation_disable_custom_all_reduce = cfg_kwargs.pop("generation_disable_custom_all_reduce")
     generation_dtype = cfg_kwargs.pop("generation_dtype")
     generation_tensor_parallel_size = cfg_kwargs.pop("generation_tensor_parallel_size")
     cfg_kwargs.pop("vllm_worker_multiproc_method")
@@ -504,10 +548,31 @@ if __name__ == '__main__':
             log_hot_storage_paths(runtime_log_path, cfg)
             ensure_runtime_paths(cfg)
             describe_cuda_environment()
+            if generation_backend == "local":
+                visible_cuda_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                resolved_tensor_parallel_size = generation_tensor_parallel_size
+                if resolved_tensor_parallel_size is None:
+                    resolved_tensor_parallel_size = visible_cuda_count if visible_cuda_count > 0 else 1
+                if (
+                    not disable_vllm
+                    and torch.cuda.is_available()
+                    and retriever_device.startswith("cuda")
+                    and resolved_tensor_parallel_size >= visible_cuda_count
+                    and visible_cuda_count > 0
+                ):
+                    print(
+                        "[warning] local vLLM tensor parallel uses all visible GPUs; "
+                        f"moving retriever_device from {retriever_device} to cpu to avoid "
+                        "sharing VRAM with vLLM/NCCL. Use generation_backend=vllm_server "
+                        "with a separate CUDA_VISIBLE_DEVICES process to keep retriever on GPU."
+                    )
+                    retriever_device = "cpu"
             print(
                 "Generator config: "
+                f"backend={generation_backend}, "
                 f"model={cfg.generation_model_name}, "
-                f"use_vllm={not disable_vllm}, "
+                f"use_vllm={not disable_vllm if generation_backend == 'local' else 'server'}, "
+                f"server_url={vllm_server_url if generation_backend == 'vllm_server' else 'n/a'}, "
                 f"max_batch_size={cfg.generation_max_batch_size}, "
                 f"max_total_tokens={cfg.generation_max_total_tokens}, "
                 f"max_model_len={generation_max_model_len or cfg.generation_max_total_tokens}, "
@@ -515,7 +580,9 @@ if __name__ == '__main__':
                 f"swap_space={generation_swap_space}, "
                 f"cpu_offload_gb={generation_cpu_offload_gb}, "
                 f"dtype={generation_dtype}, "
-                f"tensor_parallel_size={generation_tensor_parallel_size or 'all_visible'}"
+                f"tensor_parallel_size={generation_tensor_parallel_size or 'all_visible'}, "
+                f"enforce_eager={generation_enforce_eager}, "
+                f"disable_custom_all_reduce={generation_disable_custom_all_reduce}"
             )
             print(
                 "Retriever config: "
@@ -526,22 +593,38 @@ if __name__ == '__main__':
                 f"batch_size={cfg.retrieval_batch_size}"
             )
 
-            generator = LlamaGenerator(
-                LlamaGeneratorConfig(
-                    model_name=opt.generation_model_name,
-                    batch_size=opt.generation_max_batch_size,
-                    max_total_tokens=opt.generation_max_total_tokens,
-                    max_model_len=generation_max_model_len,
-                    max_new_tokens=opt.generation_max_new_tokens,
-                    min_new_tokens=opt.generation_min_new_tokens,
-                    gpu_memory_utilization=generation_gpu_memory_utilization,
-                    swap_space=generation_swap_space,
-                    cpu_offload_gb=generation_cpu_offload_gb,
-                    dtype=generation_dtype,
-                    use_vllm=not disable_vllm,
-                    tensor_parallel_size=generation_tensor_parallel_size,
+            if generation_backend == "vllm_server":
+                generator = VLLMServerGenerator(
+                    VLLMServerGeneratorConfig(
+                        model_name=opt.generation_model_name,
+                        served_model_name=vllm_server_model,
+                        base_url=vllm_server_url,
+                        batch_size=opt.generation_max_batch_size,
+                        max_total_tokens=opt.generation_max_total_tokens,
+                        max_new_tokens=opt.generation_max_new_tokens,
+                        min_new_tokens=opt.generation_min_new_tokens,
+                        request_timeout=vllm_server_timeout,
+                    )
                 )
-            )
+            else:
+                generator = LlamaGenerator(
+                    LlamaGeneratorConfig(
+                        model_name=opt.generation_model_name,
+                        batch_size=opt.generation_max_batch_size,
+                        max_total_tokens=opt.generation_max_total_tokens,
+                        max_model_len=generation_max_model_len,
+                        max_new_tokens=opt.generation_max_new_tokens,
+                        min_new_tokens=opt.generation_min_new_tokens,
+                        gpu_memory_utilization=generation_gpu_memory_utilization,
+                        swap_space=generation_swap_space,
+                        cpu_offload_gb=generation_cpu_offload_gb,
+                        dtype=generation_dtype,
+                        use_vllm=not disable_vllm,
+                        tensor_parallel_size=generation_tensor_parallel_size,
+                        enforce_eager=generation_enforce_eager,
+                        disable_custom_all_reduce=generation_disable_custom_all_reduce,
+                    )
+                )
             retriever = DenseRetriever(
                 DenseRetrieverConfig(
                     query_model_name_or_path=opt.retrieval_query_model_name_or_path,

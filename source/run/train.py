@@ -1018,6 +1018,8 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
     bad_validation_count = 0
     should_stop = False
     global_steps_this_run = 0
+    best_path = os.path.join(cfg.prediction_file_dir, "best_validation")
+    best_checkpoint_saved = False
     if args.early_stopping and args.validation_freq <= 0:
         print("[early-stopping] disabled because validation_freq <= 0")
     if args.max_train_steps > 0:
@@ -1090,9 +1092,10 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
                     if improved:
                         best_val_loss = val_loss
                         bad_validation_count = 0
-                        best_path = os.path.join(cfg.prediction_file_dir, "best_validation")
+                        clean_and_create_dir(best_path)
                         retriever.query_model.save_pretrained(best_path)
                         retriever.query_tokenizer.save_pretrained(best_path)
+                        best_checkpoint_saved = True
                         print(
                             f"[early-stopping] improvement val_loss={val_loss:.6f}; "
                             f"saved best retriever to {best_path}"
@@ -1111,12 +1114,6 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
                             )
                             should_stop = True
                             break
-
-            if args.save_freq > 0 and num_steps % args.save_freq == 0:
-                save_path = os.path.join(cfg.prediction_file_dir, f"epoch_{epoch}_step_{num_steps}")
-                retriever.query_model.save_pretrained(save_path)
-                retriever.query_tokenizer.save_pretrained(save_path)
-                print(f"[checkpoint] saved retriever to {save_path}")
 
             if num_steps % 20 == 0:
                 safe_cuda_empty_cache(f"train epoch={epoch} step={num_steps}")
@@ -1150,10 +1147,13 @@ def train(cfg, generator, retriever, indexer, optimizer, scheduler, args):
 
         print(f"[epoch-end] epoch={epoch} optimizer_steps={optimizer_steps}")
 
-    save_path = cfg.prediction_file_dir
-    retriever.query_model.save_pretrained(save_path)
-    retriever.query_tokenizer.save_pretrained(save_path)
-    print(f"[done] final retriever saved to {save_path}")
+    if not best_checkpoint_saved:
+        clean_and_create_dir(best_path)
+        retriever.query_model.save_pretrained(best_path)
+        retriever.query_tokenizer.save_pretrained(best_path)
+        print(f"[done] no validation improvement recorded; saved final retriever to {best_path}")
+    else:
+        print(f"[done] best retriever remains at {best_path}")
 
 
 def main():

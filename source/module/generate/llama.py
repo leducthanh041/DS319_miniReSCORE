@@ -47,6 +47,8 @@ class LlamaGeneratorConfig(BaseGeneratorConfig):
     dtype: Optional[str] = "half"
     swap_space: Optional[float] = 0
     cpu_offload_gb: Optional[float] = 0
+    enforce_eager: Optional[bool] = False
+    disable_custom_all_reduce: Optional[bool] = False
     # vocab_size: Optional[int] = 128256 # TODO: llama vocab_size? 128256 by default
     use_vllm: Optional[bool] = True
     eos_text: Optional[str] = None
@@ -149,6 +151,8 @@ class LlamaGenerator(BaseGenerator):
                 swap_space=self.cfg.swap_space,
                 cpu_offload_gb=self.cfg.cpu_offload_gb,
                 device=self.device.type,
+                enforce_eager=self.cfg.enforce_eager,
+                disable_custom_all_reduce=self.cfg.disable_custom_all_reduce,
                 # enable_prefix_caching=True
             )
             self.tokenizer = AutoTokenizer.from_pretrained(
