@@ -6,7 +6,8 @@ import json
 import uuid
 import subprocess
 import argparse
-from typing import Dict, Any
+from collections import defaultdict
+from typing import Dict, Any, List, Tuple
 from source.evaluation.lib import (
     get_retriever_address,
     get_llm_server_address,
@@ -55,6 +56,208 @@ def answer_extractor(
         output = potentially_cot
 
     return output
+
+
+def _normalize_retrieval_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _document_key(title: Any, paragraph_text: Any) -> Tuple[str, str]:
+    return (
+        _normalize_retrieval_text(title),
+        _normalize_retrieval_text(paragraph_text),
+    )
+
+
+def _title_key(title: Any) -> str:
+    return _normalize_retrieval_text(title)
+
+
+def _normalize_retrieval_doc(title: Any, paragraph_text: Any) -> Dict[str, str]:
+    return {
+        "title": _normalize_retrieval_text(title),
+        "paragraph_text": _normalize_retrieval_text(paragraph_text),
+    }
+
+
+def _gold_support_docs(contexts: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], set]:
+    strict_docs = []
+    title_keys = set()
+
+    for context in contexts:
+        if not context.get("is_supporting", False):
+            continue
+        title = context.get("title")
+        paragraph_text = context.get("paragraph_text") or context.get("text")
+        strict_docs.append(_normalize_retrieval_doc(title, paragraph_text))
+        title_keys.add(_title_key(title))
+
+    return strict_docs, title_keys
+
+
+def _retrieved_docs(documents: List[Dict[str, Any]], k: int) -> Tuple[List[Dict[str, str]], set]:
+    strict_docs_by_key = {}
+    title_keys = set()
+
+    for document in documents[:k]:
+        title = document.get("title")
+        paragraph_text = document.get("paragraph_text") or document.get("text")
+        doc = _normalize_retrieval_doc(title, paragraph_text)
+        strict_docs_by_key[_document_key(title, paragraph_text)] = doc
+        title_keys.add(_title_key(title))
+
+    return list(strict_docs_by_key.values()), title_keys
+
+
+def _documents_match(gold_doc: Dict[str, str], retrieved_doc: Dict[str, str]) -> bool:
+    if gold_doc["title"] != retrieved_doc["title"]:
+        return False
+
+    gold_text = gold_doc["paragraph_text"]
+    retrieved_text = retrieved_doc["paragraph_text"]
+    if not gold_text or not retrieved_text:
+        return False
+
+    return (
+        gold_text == retrieved_text
+        or gold_text in retrieved_text
+        or retrieved_text in gold_text
+    )
+
+
+def _support_docs_recall(retrieved_docs: List[Dict[str, str]], gold_docs: List[Dict[str, str]]) -> float:
+    if not gold_docs:
+        return 0.0
+
+    matched_count = 0
+    for gold_doc in gold_docs:
+        if any(_documents_match(gold_doc, retrieved_doc) for retrieved_doc in retrieved_docs):
+            matched_count += 1
+
+    return matched_count / float(len(gold_docs))
+
+
+def _safe_recall(retrieved_keys: set, gold_keys: set) -> float:
+    if not gold_keys:
+        return 0.0
+    return len(retrieved_keys & gold_keys) / float(len(gold_keys))
+
+
+def evaluate_multi_hop_recall_at_k(
+    contexts_by_qid: Dict[str, List[Dict[str, Any]]],
+    retrieval_trace_file_path: str,
+    k: int,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Evaluate cumulative multi-hop recall over inference retrieval traces.
+
+    MHR_i@k is computed against gold supporting contexts and accumulates the
+    top-k retrieved documents from iteration 1 through i.
+    """
+    traces_by_qid = defaultdict(list)
+    if not os.path.exists(retrieval_trace_file_path):
+        raise FileNotFoundError(f"Retrieval trace file not found: {retrieval_trace_file_path}")
+
+    with open(retrieval_trace_file_path, "r", encoding="utf-8") as trace_file:
+        for line in trace_file:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            qid = str(record.get("question_id"))
+            record["iteration"] = int(record.get("iteration", 0))
+            traces_by_qid[qid].append(record)
+
+    per_question = []
+    max_iteration_seen = 0
+
+    for qid, contexts in contexts_by_qid.items():
+        gold_strict, gold_titles = _gold_support_docs(contexts)
+        if not gold_strict:
+            continue
+
+        records = sorted(
+            traces_by_qid.get(str(qid), []),
+            key=lambda item: item.get("iteration", 0),
+        )
+        if records:
+            max_iteration_seen = max(max_iteration_seen, max(record["iteration"] for record in records))
+
+        retrieved_strict_so_far = {}
+        retrieved_titles_so_far = set()
+        strict_recall_by_iteration = {}
+        title_recall_by_iteration = {}
+
+        last_iteration = 0
+        for record in records:
+            iteration = record["iteration"]
+            strict_docs, title_keys = _retrieved_docs(record.get("documents", []), k)
+            for document in strict_docs:
+                retrieved_strict_so_far[(document["title"], document["paragraph_text"])] = document
+            retrieved_titles_so_far.update(title_keys)
+
+            strict_recall_by_iteration[str(iteration)] = _support_docs_recall(
+                list(retrieved_strict_so_far.values()),
+                gold_strict,
+            )
+            title_recall_by_iteration[str(iteration)] = _safe_recall(retrieved_titles_so_far, gold_titles)
+            last_iteration = iteration
+
+        final_strict_recall = _support_docs_recall(
+            list(retrieved_strict_so_far.values()),
+            gold_strict,
+        )
+        final_title_recall = _safe_recall(retrieved_titles_so_far, gold_titles)
+        per_question.append(
+            {
+                "question_id": qid,
+                "num_gold_supports": len(gold_strict),
+                "num_retrieval_iterations": last_iteration,
+                "recall_by_iteration": strict_recall_by_iteration,
+                "final_recall": final_strict_recall,
+                "title_only_recall_by_iteration": title_recall_by_iteration,
+                "title_only_final_recall": final_title_recall,
+            }
+        )
+
+    count = len(per_question)
+    metrics: Dict[str, Any] = {
+        "k": k,
+        "count": count,
+        "retrieval_trace_file": retrieval_trace_file_path,
+        "matching": "title_match_and_paragraph_exact_or_contains",
+    }
+
+    for iteration in range(1, max_iteration_seen + 1):
+        values = []
+        title_values = []
+        for item in per_question:
+            recall_by_iteration = item["recall_by_iteration"]
+            title_recall_by_iteration = item["title_only_recall_by_iteration"]
+            available_iterations = sorted(int(idx) for idx in recall_by_iteration.keys())
+            latest_iteration = max(
+                [idx for idx in available_iterations if idx <= iteration],
+                default=None,
+            )
+            if latest_iteration is None:
+                values.append(0.0)
+                title_values.append(0.0)
+            else:
+                values.append(recall_by_iteration[str(latest_iteration)])
+                title_values.append(title_recall_by_iteration[str(latest_iteration)])
+
+        metrics[f"MHR_{iteration}@{k}"] = round(sum(values) / count, 6) if count else 0.0
+        metrics[f"title_only_MHR_{iteration}@{k}"] = (
+            round(sum(title_values) / count, 6) if count else 0.0
+        )
+
+    final_values = [item["final_recall"] for item in per_question]
+    final_title_values = [item["title_only_final_recall"] for item in per_question]
+    metrics[f"MHR_final@{k}"] = round(sum(final_values) / count, 6) if count else 0.0
+    metrics[f"title_only_MHR_final@{k}"] = (
+        round(sum(final_title_values) / count, 6) if count else 0.0
+    )
+
+    return metrics, per_question
 
 
 def evaluate_by_dicts(

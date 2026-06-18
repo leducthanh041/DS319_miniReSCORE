@@ -56,6 +56,7 @@ import json
 from source.evaluation.evaluate import (
     evaluate_by_dicts,
     official_evaluate_by_dicts,
+    evaluate_multi_hop_recall_at_k,
 )
 import copy
 
@@ -134,6 +135,19 @@ def run(cfg, generator, retriever, indexer):
     clean_and_create_dir(cfg.prediction_file_dir)
     cfg.save()
 
+    retrieval_trace_file_path = os.path.join(
+        cfg.prediction_file_dir,
+        f"{cfg.dataset_split}_retrieval_trace.jsonl",
+    )
+    retrieval_evaluation_file_path = os.path.join(
+        cfg.prediction_file_dir,
+        f"{cfg.dataset_split}_retrieval_evaluation.json",
+    )
+    retrieval_per_question_file_path = os.path.join(
+        cfg.prediction_file_dir,
+        f"{cfg.dataset_split}_retrieval_per_question.jsonl",
+    )
+
     inputs, id_to_ground_truths, contexts = load_data_from_jsonl(
         file_path = cfg.data_file_path,
         ground_truth_file_path=cfg.ground_truth_file_path,
@@ -146,6 +160,7 @@ def run(cfg, generator, retriever, indexer):
             cfg=cfg,
             retriever=retriever,
             indexer=indexer,
+            retrieval_trace_file_path=retrieval_trace_file_path,
         ),
         GenerationStep(
             cfg=cfg,
@@ -193,6 +208,29 @@ def run(cfg, generator, retriever, indexer):
     )
     with open(cfg.evaluation_file_path, 'w', encoding='utf-8') as f:
         json.dump(evaluation_results, f)
+
+    try:
+        retrieval_evaluation_results, retrieval_per_question = evaluate_multi_hop_recall_at_k(
+            contexts_by_qid=contexts,
+            retrieval_trace_file_path=retrieval_trace_file_path,
+            k=cfg.retrieval_count,
+        )
+    except Exception as exc:
+        retrieval_evaluation_results = {
+            "retrieval_evaluation_skipped": True,
+            "retrieval_evaluation_skip_reason": str(exc),
+            "k": cfg.retrieval_count,
+            "retrieval_trace_file": retrieval_trace_file_path,
+        }
+        retrieval_per_question = []
+        print(f"[warning] Retrieval MHR evaluation failed: {exc}")
+
+    with open(retrieval_evaluation_file_path, "w", encoding="utf-8") as f:
+        json.dump(retrieval_evaluation_results, f, ensure_ascii=False, indent=4)
+    with open(retrieval_per_question_file_path, "w", encoding="utf-8") as f:
+        for item in retrieval_per_question:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
     official_evaluation_results = official_evaluate_by_dicts(
         prediction_type='answer',
         id_to_ground_truths=id_to_ground_truths,
@@ -205,7 +243,11 @@ def run(cfg, generator, retriever, indexer):
     print(f"Prediction directory: {cfg.prediction_file_dir}")
     print(f"Prediction JSON: {cfg.prediction_file_path}")
     print(f"Evaluation JSON: {cfg.evaluation_file_path}")
+    print(f"Retrieval trace JSONL: {retrieval_trace_file_path}")
+    print(f"Retrieval MHR JSON: {retrieval_evaluation_file_path}")
+    print(f"Retrieval per-question JSONL: {retrieval_per_question_file_path}")
     print(f"Official evaluation JSON: {cfg.official_evaluation_file_path}")
+    print(f"[retrieval] MHR_final@{cfg.retrieval_count}={retrieval_evaluation_results.get(f'MHR_final@{cfg.retrieval_count}')}")
     print(f"[done] official_f1={official_evaluation_results['f1']}")
     
     return official_evaluation_results['f1']

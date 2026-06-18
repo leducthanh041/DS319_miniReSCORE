@@ -1,121 +1,94 @@
 # ReSCORE Reproduction Workspace
 
-This repository is a practical reproduction workspace for ReSCORE, inspired by the original project at <https://github.com/leeds1219/ReSCORE>.
+This repository is a practical reproduction workspace for **ReSCORE**, inspired by the original project: <https://github.com/leeds1219/ReSCORE>.
 
 Paper: <https://arxiv.org/abs/2505.21250>  
 Project page: <https://leeds1219.github.io/ReSCORE>
 
-The active execution path in this repo is under `source/`. Scripts in `demo/` or older notes may not match the current training and inference path.
+The active execution path in this repo is under `source/`. Notes in `docs/` explain the paper/repo differences, but actual training and inference should be checked against `source/`.
 
-## What This Repo Runs
+## Overview
 
-ReSCORE trains a dense retriever for multi-hop QA with relevance-consistency supervision from an LLM. In this reproduction setup:
+ReSCORE trains a dense retriever for multi-hop question answering using LLM-based relevance-consistency supervision. This workspace supports:
 
-- the retriever is trained with gradients on one GPU
-- Llama generation and scoring are served by a persistent vLLM server on separate GPUs
-- retrieval databases are FAISS/docstore artifacts under `data/database`
-- logs are written to `logs/...`
-- checkpoints and predictions are written to `predictions/...`
+- datasets: `hotpotqa`, `2wikimultihopqa`, `musique`
+- retriever: `facebook/contriever-msmarco` or a trained checkpoint
+- generator: `meta-llama/Llama-3.1-8B-Instruct`
+- index: FAISS + SQLite docstore
+- training/inference logs under `logs/...`
+- checkpoints and predictions under `predictions/...`
 
-Supported datasets in the active scripts:
+Main entry points:
 
-- `hotpotqa`
-- `2wikimultihopqa`
-- `musique`
+```text
+source/run/train.py
+source/run/inference.py
+script/preload_vllm_server.py
+script/download/
+```
 
 ## Installation
-
-Create an environment and install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Core runtime packages:
-
-- `vllm==0.6.3.post1`
-- `faiss-gpu==1.7.2`
-- `accelerate==1.1.0`
-- `deepspeed==0.15.3`
-- `wandb`
-
-For Llama 3.1 checkpoints, configure Hugging Face access first:
+For Llama 3.1, authenticate Hugging Face first:
 
 ```bash
 export HF_TOKEN=<your_huggingface_token>
 ```
 
-If you use a fine-grained token, enable access to public gated repositories in the Hugging Face token settings.
+If you use a fine-grained token, enable access to public gated repositories.
 
-## Storage Layout
+## Storage
 
-This project can produce heavy logs, databases, and checkpoints. On shared NFS storage, SQLite/FAISS/log writes can cause I/O stalls. The recommended layout is:
-
-- keep source code in this repo
-- keep `logs` on local Docker/SSD storage
-- keep `data/database` on local Docker/SSD storage
-- keep `predictions` local to the repo if you want easy checkpoint access
-
-Example symlink layout:
+On shared NFS, heavy writes from logs, SQLite, FAISS, and checkpoints can stall I/O. Prefer local SSD/Docker storage for hot data:
 
 ```bash
 mkdir -p /docker/data/$USER/ReSCORE/logs
 mkdir -p /docker/data/$USER/ReSCORE/data/database
+mkdir -p /docker/data/$USER/ReSCORE/predictions
 
 ln -s /docker/data/$USER/ReSCORE/logs logs
 ln -s /docker/data/$USER/ReSCORE/data/database data/database
+ln -s /docker/data/$USER/ReSCORE/predictions predictions
 ```
 
-If your local disk is fast enough and has enough space, you can keep all paths in the current repo instead.
+If your machine has enough local disk and stable I/O, these paths can also stay inside the repo.
 
 ## Data Preparation
 
-Download raw multi-hop datasets:
+Download raw data:
 
 ```bash
 bash script/download/multihop_raw_data.sh
 ```
 
-Generate processed QA files:
+Create processed data:
 
 ```bash
 bash script/download/multihop_processed_data.sh
 ```
 
-Build the retrieval database and FAISS index:
+Build retrieval DB and FAISS index:
 
 ```bash
 bash script/download/build.sh
 ```
 
-Expected retrieval DB layout for each dataset:
+Expected files:
 
 ```text
-data/database/contriever_msmarco/<dataset>/
-  docstore.db
-  index.faiss
-  faiss_id_to_docstore_id.pkl
-```
-
-Expected processed data layout:
-
-```text
-data/processed_data/<dataset>/
-  train.jsonl
-  dev.jsonl
-  test.jsonl
+data/processed_data/<dataset>/{train,dev_subsampled,test_subsampled}.jsonl
+data/database/contriever_msmarco/<dataset>/{docstore.db,index.faiss,faiss_id_to_docstore_id.pkl}
 ```
 
 ## vLLM Server
 
-Training uses a persistent vLLM server so the Llama model is loaded once and reused across runs. This avoids repeatedly loading the LLM inside `train.py`.
+For stable training/inference on limited VRAM, run Llama in a persistent vLLM server on separate GPUs. Example: GPU `5,6` for vLLM, GPU `1` for the retriever client.
 
-Recommended GPU split:
-
-- GPU `1`: retriever training
-- GPU `5,6`: vLLM server for Llama generation/scoring
-
-Start vLLM before training:
+Start vLLM:
 
 ```bash
 python script/preload_vllm_server.py \
@@ -132,190 +105,183 @@ python script/preload_vllm_server.py \
   --port 8000
 ```
 
-Check that the server is alive:
+Check server:
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
 ```
 
-The server script intentionally does not kill existing vLLM processes. Use `script/kill_vllm_processes.py` manually if you want to stop them.
+This script does not kill existing vLLM processes. Stop them manually only when needed.
 
 ## Training
 
-Main entry point:
+Use the same template for all supported datasets by changing `DATASET` and `RUNNING_NAME`.
 
 ```bash
-python -m source.run.train
-```
-
-Use the same ReSCORE training template for all three datasets. Set `DATASET` to one of:
-
-```text
-hotpotqa
-2wikimultihopqa
-musique
-```
-
-Then run:
-
-```bash
-DATASET=2wikimultihopqa
-RUNNING_NAME=train_${DATASET}_vllm_server_from_scratch
+DATASET=musique
+RUNNING_NAME=train_${DATASET}_baseline
 
 CUDA_VISIBLE_DEVICES=1 python -m source.run.train \
   --running_name "${RUNNING_NAME}" \
   --dataset "${DATASET}" \
   --method rescore \
   --prompt_set 1 \
+  --batch_size 16 \
+  --n_epochs 1 \
+  --lr 1e-6 \
   --retrieval_query_model_name_or_path facebook/contriever-msmarco \
   --retrieval_passage_model_name_or_path facebook/contriever-msmarco \
   --retriever_device cuda:0 \
   --generation_backend vllm_server \
   --vllm_server_url http://127.0.0.1:8000/v1 \
   --vllm_server_scoring_mode prompt_logprobs \
-  --vllm_server_score_max_tokens 256 \
-  --num_workers 40 \
-  --generation_max_total_tokens 4096 \
-  --generation_max_new_tokens 64 \
+  --vllm_server_score_max_tokens 96 \
+  --vllm_server_prompt_logprobs 1 \
+  --vllm_server_missing_logprob_fallback -20.0 \
+  --generation_max_batch_size 1 \
+  --generation_max_total_tokens 2048 \
+  --generation_max_new_tokens 48 \
+  --retrieval_count 8 \
+  --retrieval_buffer_size 32 \
+  --retrieval_batch_size 32 \
+  --max_num_thought 6 \
+  --prompt_max_para_count 8 \
+  --prompt_max_para_words 200 \
+  --num_workers 2 \
   --early_stopping \
   --early_stopping_patience 5 \
   --early_stopping_min_delta 1e-4 \
   --validation_freq 100 \
-  --validation_batch_size 4 \
+  --validation_batch_size 2 \
   --validation_max_batches 20 \
-  --save_freq 500
+  --save_freq 10
 ```
 
-Dataset presets:
+With `CUDA_VISIBLE_DEVICES=1`, `--retriever_device cuda:0` means physical GPU `1`. Llama is not loaded by `train.py`; it is served by the vLLM process.
 
-| Dataset | `DATASET` | `RUNNING_NAME` |
-| --- | --- | --- |
-| HotpotQA | `hotpotqa` | `train_hotpotqa_vllm_server_from_scratch` |
-| 2WikiMultiHopQA | `2wikimultihopqa` | `train_2wiki_vllm_server_from_scratch` |
-| MuSiQue | `musique` | `train_musique_vllm_server_from_scratch` |
-
-Choose one row, set `DATASET` and `RUNNING_NAME`, then run the training template above.
-
-In this setup, `cuda:0` refers to logical GPU `0` inside the training process. Because `CUDA_VISIBLE_DEVICES=1`, it maps to physical GPU `1`. The Llama model is not loaded by `train.py`; it is served by the vLLM process already running on physical GPUs `5,6`.
-
-Training logs:
+Checkpoints are saved under:
 
 ```text
-logs/train/<dataset>/<running_name>__<timestamp>/train.log
-```
-
-Checkpoints:
-
-```text
-predictions/<dataset>/<run_name>/...
+predictions/<dataset>/<run_name>/multi_retrieval___train/prompt_set__<id>/retr_count__<k>/
 ```
 
 ## Inference
 
-Main entry point:
+Recommended mode: keep vLLM server running on GPU `5,6`, then run inference client on GPU `1` for retrieval.
 
-```bash
-python -m source.run.inference
-```
-
-Use a trained retriever checkpoint from `predictions/<dataset>/...`:
+Set variables:
 
 ```bash
 DATASET=musique
-CHECKPOINT_PATH=./predictions/musique/<run_name>/<checkpoint_dir>
+RUNNING_NAME=infer_${DATASET}_best_vllm_server
+CKPT=/path/to/trained/retriever/checkpoint
+DB_PATH=./data/database/contriever_msmarco/${DATASET}
+```
 
-CUDA_VISIBLE_DEVICES=5,6 python -m source.run.inference \
+Run inference:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m source.run.inference \
   --method rescore \
-  --running_name "infer_${DATASET}_best" \
+  --running_name "${RUNNING_NAME}" \
   --dataset "${DATASET}" \
   --dataset_split test \
   --prompt_set 1 \
-  --retrieval_query_model_name_or_path "${CHECKPOINT_PATH}" \
+  --batch_size 8 \
+  --retrieval_query_model_name_or_path "${CKPT}" \
   --retrieval_passage_model_name_or_path facebook/contriever-msmarco \
-  --retriever_device cuda:0
+  --database_path "${DB_PATH}" \
+  --retriever_device cuda:0 \
+  --generation_backend vllm_server \
+  --vllm_server_url http://127.0.0.1:8000/v1 \
+  --generation_max_batch_size 1 \
+  --generation_max_total_tokens 2048 \
+  --generation_max_new_tokens 48 \
+  --retrieval_count 8 \
+  --retrieval_buffer_size 32 \
+  --retrieval_batch_size 32 \
+  --max_num_thought 6 \
+  --prompt_max_para_count 8 \
+  --prompt_max_para_words 200 \
+  --runtime_log_root /docker/data/$USER/ReSCORE/logs/inference
 ```
 
-Inference logs:
+Example using the current MuSiQue checkpoint:
+
+```bash
+CKPT=predictions/musique/train_musique_baseline_resume_best___llama_3.1_8b_instruct___best_validation/multi_retrieval___train/prompt_set__1/retr_count__8/best_validation
+```
+
+For OOD inference with the same checkpoint, only change `DATASET`, `RUNNING_NAME`, and `DB_PATH`, for example:
+
+```bash
+DATASET=hotpotqa
+DB_PATH=./data/database/contriever_msmarco/hotpotqa
+```
+
+or:
+
+```bash
+DATASET=2wikimultihopqa
+DB_PATH=./data/database/contriever_msmarco/2wikimultihopqa
+```
+
+Outputs:
+
+```text
+predictions/<dataset>/<run_name>/multi_retrieval___inference/prompt_set__<id>/best/
+  test_prediction.json
+  test_evaluation.json
+  test_official_evaluation.json
+  test_retrieval_trace.jsonl
+  test_retrieval_evaluation.json
+  test_retrieval_per_question.jsonl
+  configuration.json
+```
+
+Runtime log:
 
 ```text
 logs/inference/<dataset>/<running_name>__<timestamp>/inference.log
 ```
 
-Prediction and evaluation files are written under the corresponding `predictions/...` directory.
-
 ## Evaluation
 
-Normal evaluation is run at the end of inference and saved next to predictions.
+Inference automatically writes normal evaluation results to `test_evaluation.json`.
 
-If the official evaluator for a dataset is missing, the code falls back to internal evaluation instead of crashing. The official evaluation JSON will include a flag such as:
+If an official evaluator is available, `test_official_evaluation.json` is also produced. If the official evaluator is missing, the code skips it safely and writes a warning/result marker instead of crashing.
 
-```json
-{
-  "official_evaluation_skipped": true
-}
-```
-
-## Important Runtime Notes
-
-When using `generation_backend=vllm_server`, `train.py` does not load Llama locally and does not override server-side vLLM settings such as `gpu_memory_utilization`, `tensor_parallel_size`, or `max_model_len`. Those are controlled only by `script/preload_vllm_server.py`.
-
-The vLLM server client still controls request-side limits:
-
-- `--vllm_server_score_max_tokens`: truncates prompts used for scoring
-- `--vllm_server_prompt_logprobs`: controls top-k prompt logprobs requested from vLLM
-- `--vllm_server_missing_logprob_fallback`: fallback logprob if target token is outside returned top-k
-
-For RTX 2080 Ti or other Turing GPUs, use:
+Retrieval evaluation is written to `test_retrieval_evaluation.json`. The main metric is cumulative multi-hop recall:
 
 ```text
---dtype half
+MHR_i@k = recall of gold supporting documents retrieved from iteration 1 through i
 ```
 
-`bfloat16` is not supported on these GPUs.
+For ReSCORE-style reporting, use `k = retrieval_count`. With `--retrieval_count 8`, report:
+
+```text
+MHR_1@8
+MHR_2@8
+MHR_final@8
+```
+
+The full retrieval audit trail is stored in `test_retrieval_trace.jsonl`; per-question recall details are stored in `test_retrieval_per_question.jsonl`.
+
+Main metrics to report for QA:
+
+- `em`
+- `f1`
+- `precision`
+- `recall`
+- `count`
 
 ## Troubleshooting
 
-If vLLM returns `400 Bad Request` with a message like maximum context length exceeded, lower one of:
-
-```bash
---generation_max_total_tokens
---generation_max_new_tokens
-```
-
-If vLLM returns `500 Internal Server Error` during scoring, check `train.log` for:
-
-```text
-[vllm-server-error]
-```
-
-Then reduce request-side scoring load:
-
-```bash
---vllm_server_score_max_tokens 256
---vllm_server_prompt_logprobs 1
-```
-
-If the retriever GPU is underused, increase:
-
-```bash
---retrieval_batch_size 256
-```
-
-Then try:
-
-```bash
---retrieval_batch_size 512
-```
-
-Increase `--retrieval_buffer_size` only if the vLLM server is stable, because it increases the number of LLM scoring prompts per train step.
-
-If DataLoader fails with `Too many open files`, reduce:
-
-```bash
---num_workers 4
-```
-
-If the server crashes, restart only the vLLM server. The training code does not kill or replace existing vLLM processes.
+- If vLLM reports context length errors, reduce `--generation_max_total_tokens`, `--generation_max_new_tokens`, `--prompt_max_para_count`, or `--prompt_max_para_words`.
+- If CUDA/NCCL errors appear with local vLLM, use `--generation_backend vllm_server` and separate the vLLM server GPUs from the retriever GPU.
+- If the retriever causes OOM, reduce `--retrieval_batch_size` first.
+- If DataLoader reports too many open files, reduce `--num_workers`.
+- For RTX 2080 Ti / Turing GPUs, use `--dtype half` when starting vLLM.
 
 ## Citation
 
