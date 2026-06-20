@@ -53,6 +53,7 @@ from source.module.index.index import (
     IndexerConfig
 )
 import json
+from typing import Optional
 from source.evaluation.evaluate import (
     evaluate_by_dicts,
     official_evaluate_by_dicts,
@@ -131,9 +132,29 @@ def describe_cuda_environment():
             print(f"Logical GPU {gpu_idx}: {props.name}, total_memory={total_gib:.2f} GiB")
 
 
-def run(cfg, generator, retriever, indexer):
+def run(
+    cfg,
+    generator,
+    retriever,
+    indexer,
+    runtime_arguments=None,
+    max_inference_examples: Optional[int] = None,
+):
     clean_and_create_dir(cfg.prediction_file_dir)
     cfg.save()
+
+    if runtime_arguments is not None:
+        with open(
+            os.path.join(cfg.prediction_file_dir, "runtime_arguments.json"),
+            "w",
+            encoding="utf-8",
+        ) as runtime_arguments_file:
+            json.dump(
+                runtime_arguments,
+                runtime_arguments_file,
+                ensure_ascii=False,
+                indent=4,
+            )
 
     retrieval_trace_file_path = os.path.join(
         cfg.prediction_file_dir,
@@ -154,6 +175,17 @@ def run(cfg, generator, retriever, indexer):
         return_contexts=True,
         is_demo=cfg.demo,
     )
+
+    if max_inference_examples is not None:
+        selected_ids = list(inputs.keys())[:max_inference_examples]
+        inputs = {qid: inputs[qid] for qid in selected_ids}
+        id_to_ground_truths = {
+            qid: id_to_ground_truths[qid] for qid in selected_ids
+        }
+        contexts = {qid: contexts[qid] for qid in selected_ids}
+        with open(cfg.ground_truth_file_path, "w", encoding="utf-8") as f:
+            json.dump(id_to_ground_truths, f, ensure_ascii=False, indent=4)
+        print(f"[inference] Limiting inference to {len(selected_ids)} examples.")
 
     pipeline = [
         RetrievalStep(
@@ -351,6 +383,21 @@ if __name__ == '__main__':
         help="HTTP request timeout in seconds when generation_backend=vllm_server."
     )
     parser.add_argument(
+        "--vllm_server_max_model_len",
+        type=int,
+        default=None,
+        help=(
+            "Actual max_model_len of the running vLLM server. Prompts are "
+            "clamped to this value to avoid HTTP 400 context errors."
+        ),
+    )
+    parser.add_argument(
+        "--vllm_server_context_safety_margin",
+        type=int,
+        default=16,
+        help="Token margin reserved for client/server token-count differences.",
+    )
+    parser.add_argument(
         "--generation_max_batch_size",
         type=int,
         default=4,
@@ -538,8 +585,24 @@ if __name__ == '__main__':
         default="./logs/inference",
         help="Runtime log root directory"
     )
+    parser.add_argument(
+        "--prediction_root",
+        type=str,
+        default="./predictions",
+        help="Root directory for predictions and evaluation files.",
+    )
+    parser.add_argument(
+        "--max_inference_examples",
+        type=int,
+        default=None,
+        help="Optional example limit for a fair baseline/TTA smoke test.",
+    )
 
     opt = parser.parse_args()
+    if opt.max_inference_examples is not None and opt.max_inference_examples <= 0:
+        parser.error("--max_inference_examples must be greater than zero.")
+    if opt.vllm_server_context_safety_margin < 0:
+        parser.error("--vllm_server_context_safety_margin cannot be negative.")
 
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = opt.vllm_worker_multiproc_method
     try:
@@ -555,6 +618,10 @@ if __name__ == '__main__':
     vllm_server_url = cfg_kwargs.pop("vllm_server_url")
     vllm_server_model = cfg_kwargs.pop("vllm_server_model")
     vllm_server_timeout = cfg_kwargs.pop("vllm_server_timeout")
+    vllm_server_max_model_len = cfg_kwargs.pop("vllm_server_max_model_len")
+    vllm_server_context_safety_margin = cfg_kwargs.pop(
+        "vllm_server_context_safety_margin"
+    )
     generation_max_model_len = cfg_kwargs.pop("generation_max_model_len")
     generation_gpu_memory_utilization = cfg_kwargs.pop("generation_gpu_memory_utilization")
     generation_swap_space = cfg_kwargs.pop("generation_swap_space")
@@ -565,11 +632,14 @@ if __name__ == '__main__':
     generation_tensor_parallel_size = cfg_kwargs.pop("generation_tensor_parallel_size")
     cfg_kwargs.pop("vllm_worker_multiproc_method")
     disable_vllm = cfg_kwargs.pop("disable_vllm")
+    prediction_root = cfg_kwargs.pop("prediction_root")
+    max_inference_examples = cfg_kwargs.pop("max_inference_examples")
 
     seed_everything(opt.seed)
     cfg = PipelineConfig(**cfg_kwargs)
     if database_path:
         cfg.database_path_override = database_path
+    cfg.prediction_root_override = prediction_root
 
     runtime_log_path = build_runtime_log_path(runtime_log_root, cfg.dataset, cfg.running_name)
     os.makedirs(os.path.dirname(runtime_log_path), exist_ok=True)
@@ -636,17 +706,32 @@ if __name__ == '__main__':
             )
 
             if generation_backend == "vllm_server":
+                server_max_total_tokens = opt.generation_max_total_tokens
+                if vllm_server_max_model_len is not None:
+                    server_max_total_tokens = min(
+                        server_max_total_tokens,
+                        vllm_server_max_model_len,
+                    )
                 generator = VLLMServerGenerator(
                     VLLMServerGeneratorConfig(
                         model_name=opt.generation_model_name,
                         served_model_name=vllm_server_model,
                         base_url=vllm_server_url,
                         batch_size=opt.generation_max_batch_size,
-                        max_total_tokens=opt.generation_max_total_tokens,
+                        max_total_tokens=server_max_total_tokens,
                         max_new_tokens=opt.generation_max_new_tokens,
                         min_new_tokens=opt.generation_min_new_tokens,
                         request_timeout=vllm_server_timeout,
+                        context_safety_margin=(
+                            vllm_server_context_safety_margin
+                        ),
                     )
+                )
+                print(
+                    "vLLM server context: "
+                    f"server_max_model_len={vllm_server_max_model_len}, "
+                    f"effective_max_total_tokens={server_max_total_tokens}, "
+                    f"context_safety_margin={vllm_server_context_safety_margin}"
                 )
             else:
                 generator = LlamaGenerator(
@@ -684,7 +769,14 @@ if __name__ == '__main__':
                 )
             )
 
-            run(cfg, generator, retriever, indexer)
+            run(
+                cfg,
+                generator,
+                retriever,
+                indexer,
+                runtime_arguments=vars(opt).copy(),
+                max_inference_examples=max_inference_examples,
+            )
         finally:
             sys.stdout.flush()
             sys.stderr.flush()

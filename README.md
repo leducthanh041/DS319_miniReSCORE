@@ -134,6 +134,8 @@ CUDA_VISIBLE_DEVICES=1 python -m source.run.train \
   --retriever_device cuda:0 \
   --generation_backend vllm_server \
   --vllm_server_url http://127.0.0.1:8000/v1 \
+  --vllm_server_max_model_len 2048 \
+  --vllm_server_context_safety_margin 16 \
   --vllm_server_scoring_mode prompt_logprobs \
   --vllm_server_score_max_tokens 96 \
   --vllm_server_prompt_logprobs 1 \
@@ -167,66 +169,141 @@ predictions/<dataset>/<run_name>/multi_retrieval___train/prompt_set__<id>/retr_c
 
 ## Inference
 
-Recommended mode: keep vLLM server running on GPU `5,6`, then run inference client on GPU `1` for retrieval.
+Recommended setup: keep the vLLM server on GPUs `5,6`, then run the inference client on a separate retriever GPU, for example physical GPU `1`.
 
-Set variables:
+Use a MuSiQue-trained retriever checkpoint for both in-domain and OOD evaluation:
 
 ```bash
-DATASET=musique
-RUNNING_NAME=infer_${DATASET}_best_vllm_server
-CKPT=/path/to/trained/retriever/checkpoint
-DB_PATH=./data/database/contriever_msmarco/${DATASET}
+CKPT=./predictions/musique/train_musique_baseline_resume_best___llama_3.1_8b_instruct___best_validation/multi_retrieval___train/prompt_set__1/retr_count__8/best_validation
 ```
 
-Run inference:
+### Baseline
+
+```bash
+BASE_COMMON_ARGS="\
+--method rescore \
+--dataset_split test \
+--prompt_set 1 \
+--batch_size 1 \
+--retrieval_query_model_name_or_path ${CKPT} \
+--retriever_device cuda:0 \
+--generation_backend vllm_server \
+--vllm_server_url http://127.0.0.1:8000/v1 \
+--vllm_server_max_model_len 2048 \
+--vllm_server_context_safety_margin 16 \
+--generation_max_batch_size 1 \
+--generation_max_total_tokens 4096 \
+--generation_max_new_tokens 48 \
+--retrieval_count 8 \
+--retrieval_buffer_size 32 \
+--retrieval_batch_size 32 \
+--retrieval_no_duplicates \
+--max_num_thought 6 \
+--prompt_max_para_count 8 \
+--prompt_max_para_words 200 \
+--prediction_root /docker/data/$USER/ReSCORE/predictions \
+--runtime_log_root /docker/data/$USER/ReSCORE/logs/inference"
+```
+
+Run MuSiQue in-domain baseline:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -m source.run.inference \
-  --method rescore \
-  --running_name "${RUNNING_NAME}" \
-  --dataset "${DATASET}" \
-  --dataset_split test \
-  --prompt_set 1 \
-  --batch_size 8 \
-  --retrieval_query_model_name_or_path "${CKPT}" \
-  --retrieval_passage_model_name_or_path facebook/contriever-msmarco \
-  --database_path "${DB_PATH}" \
-  --retriever_device cuda:0 \
-  --generation_backend vllm_server \
-  --vllm_server_url http://127.0.0.1:8000/v1 \
-  --generation_max_batch_size 1 \
-  --generation_max_total_tokens 2048 \
-  --generation_max_new_tokens 48 \
-  --retrieval_count 8 \
-  --retrieval_buffer_size 32 \
-  --retrieval_batch_size 32 \
-  --max_num_thought 6 \
-  --prompt_max_para_count 8 \
-  --prompt_max_para_words 200 \
-  --runtime_log_root /docker/data/$USER/ReSCORE/logs/inference
+  --running_name infer_musique_fair_baseline \
+  --dataset musique \
+  --database_path ./data/database/contriever_msmarco/musique \
+  ${BASE_COMMON_ARGS}
 ```
 
-Example using the current MuSiQue checkpoint:
+### Test-Time Adaptation
+
+TTA uses the same generator, retriever checkpoint, retrieval DB, and prompt budget as the baseline. It additionally performs per-test query adaptation and LoRA adaptation.
 
 ```bash
-CKPT=predictions/musique/train_musique_baseline_resume_best___llama_3.1_8b_instruct___best_validation/multi_retrieval___train/prompt_set__1/retr_count__8/best_validation
+TTA_COMMON_ARGS="\
+--method iqatr_tta \
+--dataset_split test \
+--prompt_set 1 \
+--batch_size 1 \
+--retrieval_query_model_name_or_path ${CKPT} \
+--retriever_device cuda:0 \
+--generation_model_name meta-llama/Llama-3.1-8B-Instruct \
+--generation_backend vllm_server \
+--vllm_server_url http://127.0.0.1:8000/v1 \
+--vllm_server_scoring_mode prompt_logprobs \
+--vllm_server_score_max_tokens 512 \
+--vllm_server_prompt_logprobs 20 \
+--vllm_server_max_model_len 2048 \
+--vllm_server_missing_logprob_fallback -20.0 \
+--vllm_server_context_safety_margin 16 \
+--generation_max_batch_size 1 \
+--generation_max_total_tokens 4096 \
+--generation_max_new_tokens 48 \
+--retrieval_count 8 \
+--retrieval_buffer_size 32 \
+--retrieval_no_duplicates \
+--retrieval_batch_size 32 \
+--max_num_thought 6 \
+--prompt_max_para_count 8 \
+--prompt_max_para_words 200 \
+--tta_level both \
+--tta_pseudo_label dual \
+--tta_inner_steps 3 \
+--tta_query_lr 1.2 \
+--tta_momentum 0.99 \
+--tta_weight_decay 0.01 \
+--tta_temperature 0.5 \
+--tta_nucleus_p 0.5 \
+--tta_anchor_weight 0.1 \
+--tta_max_grad_norm 1.0 \
+--tta_warmup_steps 0 \
+--tta_refresh_candidates_each_step \
+--tta_confidence_threshold 0.0 \
+--tta_fail_on_pseudo_label_error \
+--tta_lora_rank 8 \
+--tta_lora_alpha 16 \
+--tta_lora_lr 5e-4 \
+--tta_lora_loss_weight 1.0 \
+--tta_lora_num_top_layers 4 \
+--tta_lora_reg_weight 0.01 \
+--tta_cross_encoder_device cuda:0 \
+--tta_cross_encoder_batch_size 32 \
+--tta_cross_encoder_max_length 512 \
+--tta_clear_cross_encoder_cache \
+--tta_log_every 1 \
+--runtime_log_root /docker/data/$USER/ReSCORE/logs/inference_tta \
+--prediction_root /docker/data/$USER/ReSCORE/predictions"
 ```
 
-For OOD inference with the same checkpoint, only change `DATASET`, `RUNNING_NAME`, and `DB_PATH`, for example:
+Run MuSiQue in-domain TTA:
 
 ```bash
-DATASET=hotpotqa
-DB_PATH=./data/database/contriever_msmarco/hotpotqa
+CUDA_VISIBLE_DEVICES=1 python -m source.run.inference_tta \
+  --running_name infer_tta_musique_ind_both_dual_full \
+  --dataset musique \
+  --database_path ./data/database/contriever_msmarco/musique \
+  ${TTA_COMMON_ARGS}
 ```
 
-or:
+Run OOD TTA using the same MuSiQue checkpoint:
 
 ```bash
-DATASET=2wikimultihopqa
-DB_PATH=./data/database/contriever_msmarco/2wikimultihopqa
+CUDA_VISIBLE_DEVICES=1 python -m source.run.inference_tta \
+  --running_name infer_tta_hotpotqa_ood_musique_ckpt_both_dual_full \
+  --dataset hotpotqa \
+  --database_path ./data/database/contriever_msmarco/hotpotqa \
+  ${TTA_COMMON_ARGS}
+
+CUDA_VISIBLE_DEVICES=1 python -m source.run.inference_tta \
+  --running_name infer_tta_2wiki_ood_musique_ckpt_both_dual_full \
+  --dataset 2wikimultihopqa \
+  --database_path ./data/database/contriever_msmarco/2wikimultihopqa \
+  ${TTA_COMMON_ARGS}
 ```
 
-Outputs:
+Use `--max_inference_examples 10` for a smoke test. If vLLM reports context-length errors, increase `--vllm_server_context_safety_margin` to `32`. If vLLM runs out of memory, reduce `--vllm_server_score_max_tokens`, `--prompt_max_para_count`, or `--prompt_max_para_words`.
+
+Outputs are written under:
 
 ```text
 predictions/<dataset>/<run_name>/multi_retrieval___inference/prompt_set__<id>/best/
@@ -236,14 +313,11 @@ predictions/<dataset>/<run_name>/multi_retrieval___inference/prompt_set__<id>/be
   test_retrieval_trace.jsonl
   test_retrieval_evaluation.json
   test_retrieval_per_question.jsonl
+  runtime_arguments.json
   configuration.json
 ```
 
-Runtime log:
-
-```text
-logs/inference/<dataset>/<running_name>__<timestamp>/inference.log
-```
+TTA additionally writes `test_tta_summary.json`.
 
 ## Evaluation
 

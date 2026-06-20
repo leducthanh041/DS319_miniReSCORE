@@ -71,8 +71,8 @@ class PipelineConfig:
     retrieval_count: Optional[Literal[2, 4, 6, 8]] = 8
     retrieval_buffer_size: Optional[int] = 100
     retrieval_no_duplicates: Optional[bool] = True
-    retrieval_no_reasoning_sentences: Optional[bool] = True # Store true
-    retrieval_no_wh_words: Optional[bool] = True # Store true
+    retrieval_no_reasoning_sentences: Optional[bool] = True
+    retrieval_no_wh_words: Optional[bool] = True
     
     # Retriever
     retrieval_query_model_name_or_path: Optional[str] = 'facebook/contriever-msmarco'
@@ -85,7 +85,7 @@ class PipelineConfig:
     # End
     max_num_thought: int = 6
     min_num_thought: int = 1
-    answer_regex: str = ".* answer is:? (.*)\\.?" # answer_regex: str = ".* Answer: <.*>\\.?"
+    answer_regex: str = ".* answer is:? (.*)\\.?"
     match_all_on_failure: bool = True
 
     # Etc
@@ -103,16 +103,64 @@ class PipelineConfig:
     wandb_key: Optional[str] = None
     prediction_root_override: Optional[str] = None
 
+    # ── TTA (Test-Time Adaptation) ────────────────────────────────
+    # General TTA settings
+    use_tta: Optional[bool] = False
+    tta_level: Optional[str] = 'both'
+    # Choices: 'l1' | 'l2' | 'both'
+    #   l1   = query vector optimization only (TOUR-style, zero param update)
+    #   l2   = LoRA adaptation only           (requires batch_size=1)
+    #   both = L1 + L2 combined               (requires batch_size=1)
+
+    tta_pseudo_label: Optional[str] = 'dual'
+    # Choices: 'ce_only' | 'lm_only' | 'dual'
+    #   ce_only  = cross-encoder scores only       (fastest, no extra LLM calls)
+    #   lm_only  = P_LM(q|d) only                 (no cross-encoder)
+    #   dual     = CE * P_LM(q|d)                 (best quality, needs LLM calls)
+
+    # Cross-encoder (CE signal trong pseudo-label)
+    tta_cross_encoder_model: Optional[str] = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+    tta_cross_encoder_batch_size: Optional[int] = 32
+    tta_cross_encoder_device: Optional[str] = None
+    tta_cross_encoder_max_length: Optional[int] = 512
+    tta_clear_cross_encoder_cache: Optional[bool] = True
+    tta_log_every: Optional[int] = 1
+
+    # Level 1: Query Vector Optimization hyperparameters
+    # Nguồn: TOUR paper (Table 7, Appendix D)
+    tta_inner_steps: Optional[int] = 3          # T_inner: max gradient steps/hop
+    tta_query_lr: Optional[float] = 1.2         # eta_q: TOUR Table 7 = 1.2
+    tta_momentum: Optional[float] = 0.99        # SGD momentum: TOUR Appendix D
+    tta_weight_decay: Optional[float] = 0.01    # SGD weight decay: TOUR Appendix D
+    tta_temperature: Optional[float] = 0.5      # tau: CE softmax temperature
+    tta_nucleus_p: Optional[float] = 0.5        # p: nucleus threshold (hard labels)
+    tta_anchor_weight: Optional[float] = 0.1    # beta: anchor regularization weight
+    tta_max_grad_norm: Optional[float] = 1.0
+    tta_warmup_steps: Optional[int] = 0
+    tta_refresh_candidates_each_step: Optional[bool] = True
+    tta_confidence_threshold: Optional[float] = 0.0
+    tta_fail_on_pseudo_label_error: Optional[bool] = True
+
+    # Level 2: LoRA Adaptation hyperparameters
+    tta_lora_rank: Optional[int] = 8            # r: LoRA rank
+    tta_lora_alpha: Optional[float] = 16.0      # lora_alpha: scaling = alpha / rank
+    tta_lora_lr: Optional[float] = 5e-4         # eta_LoRA: Adam learning rate
+    tta_lora_loss_weight: Optional[float] = 1.0  # alpha: LoRA KL weight
+    tta_lora_num_top_layers: Optional[int] = 4  # N top transformer layers để inject
+    tta_lora_reg_weight: Optional[float] = 0.01 # gamma: LoRA norm regularization weight
+    # ── End TTA ───────────────────────────────────────────────────
+
     def __post_init__(self):
         seed_everything(self.seed)
         
-        if self.method in {"rescore", "iqatr"}:
+        if self.method in {"rescore", "iqatr", "iqatr_tta"}:
             self.min_num_thought = 1
         elif self.method == "base":
             self.min_num_thought = 0
         else:
             raise NotImplementedError(
-                f"Unsupported method: {self.method}. Supported methods: rescore, iqatr, base"
+                f"Unsupported method: {self.method}. "
+                f"Supported methods: rescore, iqatr, iqatr_tta, base"
             )
             
         if self.wandb_key:
@@ -282,6 +330,25 @@ class PipelineConfig:
             './', 'prompts', f"prompt_set__{self.prompt_set}", "thought_gen.txt"
         )
 
-    def save(self):
-        with open(self.configuration_file_path, 'w') as f:
-            json.dump(self.__dict__, f, indent=4)
+    # ── TTA prompt properties ──────────────────────────────────────
+    @property
+    def tta_q_rel_input_prompt_file_path(self):
+        """
+        Prompt condition cho P_LM(q|d): yêu cầu LLM sinh câu hỏi từ document.
+        Dùng khi tta_pseudo_label in ('dual', 'lm_only').
+        File: prompts/prompt_set__1/q_rel_input.txt
+        """
+        return os.path.join(
+            './', 'prompts', f"prompt_set__{self.prompt_set}", "q_rel_input.txt"
+        )
+
+    @property
+    def tta_q_rel_output_prompt_file_path(self):
+        """
+        Prediction template cho P_LM(q|d): format {"question": "{question}"}.
+        File: prompts/prompt_set__1/q_rel_output.txt
+        """
+        return os.path.join(
+            './', 'prompts', f"prompt_set__{self.prompt_set}", "q_rel_output.txt"
+        )
+    # ── End TTA prompt properties ──────────────────────────────────

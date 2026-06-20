@@ -148,7 +148,34 @@ class DenseRetriever(BaseRetriever):
         )
         
         return embeddings
-        
+
+    def embed_single_query_no_detach(
+        self,
+        query_text: str,
+    ) -> torch.Tensor:
+        model_inputs = self.query_tokenizer.batch_encode_plus(
+            [query_text],
+            return_tensors="pt",
+            max_length=self.cfg.max_length,
+            padding=True,
+            truncation=True,
+        )
+        model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
+
+        # Không wrap trong torch.no_grad() — cần gradient để:
+        # - Level 2: backprop qua LoRA params (B, A matrices)
+        # - Level 1: lấy q_0 rồi detach, nên không cần grad ở đây,
+        #            nhưng giữ chung interface cho cả hai level
+        model_outputs = self.query_model(**model_inputs)
+
+        embedding = pooling(
+            token_embeddings=model_outputs[0],
+            mask=model_inputs['attention_mask'],
+            pooling=self.cfg.pooling,
+            normalize=self.cfg.normalize,
+        )
+
+        return embedding[0]  # [d] — remove batch dimension
     
 def pooling(
     token_embeddings, 
