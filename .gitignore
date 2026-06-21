@@ -31,6 +31,7 @@ ENV/
 
 # Logs and runtime outputs
 logs/
+logs
 *.log
 wandb/
 runs/
@@ -77,4 +78,4 @@ best_validation/
 train_*/
 tmp/
 temp/
-TouR
+TouR/
