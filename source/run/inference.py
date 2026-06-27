@@ -35,6 +35,12 @@ from source.pipeline.controller import PipelineController
 from source.pipeline.state import QuestionState
 from source.utility.system_utils import seed_everything
 from source.utility.data_utils import clean_and_create_dir
+from source.utility.report_metrics import (
+    SectionTimer,
+    build_report_metrics,
+    load_report_metrics,
+    write_report_metrics,
+)
 
 from source.module.generate.llama import (
     LlamaGenerator,
@@ -139,7 +145,9 @@ def run(
     indexer,
     runtime_arguments=None,
     max_inference_examples: Optional[int] = None,
+    baseline_report_metrics=None,
 ):
+    timer = SectionTimer()
     clean_and_create_dir(cfg.prediction_file_dir)
     cfg.save()
 
@@ -168,13 +176,19 @@ def run(
         cfg.prediction_file_dir,
         f"{cfg.dataset_split}_retrieval_per_question.jsonl",
     )
+    report_metrics_file_path = os.path.join(
+        cfg.prediction_file_dir,
+        f"{cfg.dataset_split}_report_metrics.json",
+    )
 
+    timer.start("data_loading")
     inputs, id_to_ground_truths, contexts = load_data_from_jsonl(
         file_path = cfg.data_file_path,
         ground_truth_file_path=cfg.ground_truth_file_path,
         return_contexts=True,
         is_demo=cfg.demo,
     )
+    timer.stop("data_loading")
 
     if max_inference_examples is not None:
         selected_ids = list(inputs.keys())[:max_inference_examples]
@@ -222,11 +236,14 @@ def run(
         )
         for question_id, question_text in inputs.items()
     ]
+    timer.start("pipeline_inference")
     controller.run(
         start_states,
         batch_size=cfg.batch_size
     )
+    pipeline_time_sec = timer.stop("pipeline_inference")
     
+    timer.start("evaluation")
     with open(cfg.ground_truth_file_path, 'r', encoding='utf-8') as f:
         id_to_ground_truths = json.load(f)
         
@@ -263,14 +280,37 @@ def run(
         for item in retrieval_per_question:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    official_evaluation_results = official_evaluate_by_dicts(
-        prediction_type='answer',
-        id_to_ground_truths=id_to_ground_truths,
-        id_to_predictions=id_to_predictions,
-        dataset=cfg.dataset
-    )
+    try:
+        official_evaluation_results = official_evaluate_by_dicts(
+            prediction_type='answer',
+            id_to_ground_truths=id_to_ground_truths,
+            id_to_predictions=id_to_predictions,
+            dataset=cfg.dataset
+        )
+    except Exception as exc:
+        official_evaluation_results = {
+            **evaluation_results,
+            "official_evaluation_skipped": True,
+            "official_evaluation_skip_reason": str(exc),
+        }
+        print(f"[warning] Official evaluation failed: {exc}")
     with open(cfg.official_evaluation_file_path, 'w') as f:
         json.dump(official_evaluation_results, f)
+    timer.stop("evaluation")
+
+    report_metrics = build_report_metrics(
+        cfg=cfg,
+        evaluation_results=evaluation_results,
+        official_evaluation_results=official_evaluation_results,
+        retrieval_evaluation_results=retrieval_evaluation_results,
+        num_examples=len(inputs),
+        pipeline_time_sec=pipeline_time_sec,
+        section_times=timer.sections,
+        retriever=retriever,
+        generator=generator,
+        baseline_report_metrics=baseline_report_metrics,
+    )
+    write_report_metrics(report_metrics, report_metrics_file_path)
 
     print(f"Prediction directory: {cfg.prediction_file_dir}")
     print(f"Prediction JSON: {cfg.prediction_file_path}")
@@ -279,7 +319,14 @@ def run(
     print(f"Retrieval MHR JSON: {retrieval_evaluation_file_path}")
     print(f"Retrieval per-question JSONL: {retrieval_per_question_file_path}")
     print(f"Official evaluation JSON: {cfg.official_evaluation_file_path}")
+    print(f"Report metrics JSON: {report_metrics_file_path}")
     print(f"[retrieval] MHR_final@{cfg.retrieval_count}={retrieval_evaluation_results.get(f'MHR_final@{cfg.retrieval_count}')}")
+    print(
+        "[runtime] "
+        f"pipeline_time_sec={report_metrics['runtime']['total_time_sec']}, "
+        f"latency_per_question_sec={report_metrics['runtime']['latency_per_question_sec']}, "
+        f"throughput_qph={report_metrics['runtime']['throughput_questions_per_hour']}"
+    )
     print(f"[done] official_f1={official_evaluation_results['f1']}")
     
     return official_evaluation_results['f1']
@@ -597,6 +644,16 @@ if __name__ == '__main__':
         default=None,
         help="Optional example limit for a fair baseline/TTA smoke test.",
     )
+    parser.add_argument(
+        "--baseline_report_metrics",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a baseline *_report_metrics.json. The current "
+            "report will include absolute/relative quality gains and runtime "
+            "overhead versus that baseline."
+        ),
+    )
 
     opt = parser.parse_args()
     if opt.max_inference_examples is not None and opt.max_inference_examples <= 0:
@@ -634,6 +691,7 @@ if __name__ == '__main__':
     disable_vllm = cfg_kwargs.pop("disable_vllm")
     prediction_root = cfg_kwargs.pop("prediction_root")
     max_inference_examples = cfg_kwargs.pop("max_inference_examples")
+    baseline_report_metrics_path = cfg_kwargs.pop("baseline_report_metrics")
 
     seed_everything(opt.seed)
     cfg = PipelineConfig(**cfg_kwargs)
@@ -776,6 +834,9 @@ if __name__ == '__main__':
                 indexer,
                 runtime_arguments=vars(opt).copy(),
                 max_inference_examples=max_inference_examples,
+                baseline_report_metrics=load_report_metrics(
+                    baseline_report_metrics_path
+                ),
             )
         finally:
             sys.stdout.flush()

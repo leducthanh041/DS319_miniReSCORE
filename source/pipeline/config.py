@@ -153,14 +153,14 @@ class PipelineConfig:
     def __post_init__(self):
         seed_everything(self.seed)
         
-        if self.method in {"rescore", "iqatr", "iqatr_tta"}:
+        if self.method in {"rescore", "iqatr", "iqatr_tta", "iqatr_tta_hard"}:
             self.min_num_thought = 1
         elif self.method == "base":
             self.min_num_thought = 0
         else:
             raise NotImplementedError(
                 f"Unsupported method: {self.method}. "
-                f"Supported methods: rescore, iqatr, iqatr_tta, base"
+                f"Supported methods: rescore, iqatr, iqatr_tta, iqatr_tta_hard, base"
             )
             
         if self.wandb_key:

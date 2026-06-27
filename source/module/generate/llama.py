@@ -11,7 +11,6 @@ from typing import List, Literal, Optional, Any
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.utils import is_accelerate_available
-from vllm import LLM, SamplingParams
 import torch
 from math import exp
 from source.module.generate.utils import EOSReachedCriteria
@@ -19,6 +18,19 @@ from source.module.generate.base import BaseGenerator, BaseGeneratorConfig
 
 PAD_TOKEN_LABEL_ID = torch.nn.CrossEntropyLoss().ignore_index
 FORCE_RESET = bool(int(os.getenv("FORCE_RESET", "0")))
+
+
+def _load_vllm_classes():
+    try:
+        from vllm import LLM, SamplingParams
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to import vLLM for local LlamaGenerator(use_vllm=True). "
+            "If you are using generation_backend=vllm_server, this import should "
+            "not be needed; check that no local LlamaGenerator is being created. "
+            f"Original error: {error}"
+        ) from error
+    return LLM, SamplingParams
 
 @dataclass
 class LlamaGeneratorConfig(BaseGeneratorConfig):
@@ -131,6 +143,7 @@ class LlamaGenerator(BaseGenerator):
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if self.cfg.use_vllm: 
+            LLM, _ = _load_vllm_classes()
             self.vllm_max_model_len = self.cfg.max_model_len or self.cfg.max_total_tokens
             visible_gpu_count = torch.cuda.device_count() if self.device.type == 'cuda' else 0
             tensor_parallel_size = self.cfg.tensor_parallel_size
@@ -251,6 +264,7 @@ class LlamaGenerator(BaseGenerator):
         inputs = List[str],
     ):
         if self.cfg.use_vllm:
+            _, SamplingParams = _load_vllm_classes()
             sampling_params = SamplingParams(
                 n=self.cfg.num_return_sequences,
                 repetition_penalty=self.cfg.repetition_penalty,
@@ -415,6 +429,7 @@ class LlamaGenerator(BaseGenerator):
             answer_token_ids.append(cur_answer_ids)
             prompt_token_ids.append(cur_input_ids + cur_answer_ids)
 
+        _, SamplingParams = _load_vllm_classes()
         sampling_params = SamplingParams(
             temperature=0.0,
             max_tokens=1,

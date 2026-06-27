@@ -97,6 +97,12 @@ from source.pipeline.step.generation import (
 )
 from source.pipeline.step.tta_retrieval_hard import TTARetrievalStepHard
 from source.utility.data_utils import clean_and_create_dir, load_data_from_jsonl
+from source.utility.report_metrics import (
+    SectionTimer,
+    build_report_metrics,
+    load_report_metrics,
+    write_report_metrics,
+)
 from source.utility.system_utils import seed_everything
 
 
@@ -218,8 +224,11 @@ def run_tta(
     cross_encoder,
     runtime_arguments: Optional[Dict[str, Any]] = None,
     max_inference_examples: Optional[int] = None,
+    lora_stats: Optional[Dict[str, Any]] = None,
+    baseline_report_metrics: Optional[Dict[str, Any]] = None,
 ):
     """Chạy TTA inference và evaluation."""
+    timer = SectionTimer()
     clean_and_create_dir(cfg.prediction_file_dir)
     cfg.save()
 
@@ -239,6 +248,10 @@ def run_tta(
         cfg.prediction_file_dir,
         f"{cfg.dataset_split}_tta_summary.json",
     )
+    report_metrics_file_path = os.path.join(
+        cfg.prediction_file_dir,
+        f"{cfg.dataset_split}_report_metrics.json",
+    )
     runtime_arguments_file_path = os.path.join(
         cfg.prediction_file_dir,
         "runtime_arguments.json",
@@ -247,12 +260,14 @@ def run_tta(
         with open(runtime_arguments_file_path, "w", encoding="utf-8") as f:
             json.dump(runtime_arguments, f, ensure_ascii=False, indent=4)
 
+    timer.start("data_loading")
     inputs, id_to_ground_truths, contexts = load_data_from_jsonl(
         file_path=cfg.data_file_path,
         ground_truth_file_path=cfg.ground_truth_file_path,
         return_contexts=True,
         is_demo=cfg.demo,
     )
+    timer.stop("data_loading")
 
     if max_inference_examples is not None:
         selected_ids = list(inputs.keys())[:max_inference_examples]
@@ -288,9 +303,12 @@ def run_tta(
     else:
         effective_batch_size = cfg.batch_size
 
+    timer.start("pipeline_inference")
     controller.run(start_states, batch_size=effective_batch_size)
+    pipeline_time_sec = timer.stop("pipeline_inference")
 
     # ── Load results ──
+    timer.start("evaluation")
     with open(cfg.ground_truth_file_path, 'r', encoding='utf-8') as f:
         id_to_ground_truths = json.load(f)
     with open(cfg.prediction_file_path, 'r', encoding='utf-8') as f:
@@ -350,6 +368,27 @@ def run_tta(
         print(f"[warning] Official evaluation failed: {exc}")
     with open(cfg.official_evaluation_file_path, 'w', encoding='utf-8') as f:
         json.dump(official_evaluation_results, f, ensure_ascii=False, indent=4)
+    timer.stop("evaluation")
+
+    report_metrics = build_report_metrics(
+        cfg=cfg,
+        evaluation_results=evaluation_results,
+        official_evaluation_results=official_evaluation_results,
+        retrieval_evaluation_results=retrieval_evaluation_results,
+        num_examples=len(inputs),
+        pipeline_time_sec=pipeline_time_sec,
+        section_times=timer.sections,
+        retriever=retriever,
+        generator=generator,
+        cross_encoder=cross_encoder,
+        lora_stats=(
+            {**lora_stats, "available": True} if lora_stats is not None else None
+        ),
+        tta_trace_file_path=retrieval_trace_file_path,
+        tta_variant="hard",
+        baseline_report_metrics=baseline_report_metrics,
+    )
+    write_report_metrics(report_metrics, report_metrics_file_path)
 
     print(f"\n{'='*60}")
     print(f"[TTA Inference Done: hard]")
@@ -360,6 +399,11 @@ def run_tta(
     print(f"  {mhr_key}: {retrieval_evaluation_results.get(mhr_key, 'N/A')}")
     print(f"  TTA summary:     {tta_summary_file_path}")
     print(f"  Retrieval trace: {retrieval_trace_file_path}")
+    print(f"  Report metrics:  {report_metrics_file_path}")
+    print(
+        f"  Runtime:         {report_metrics['runtime']['total_time_sec']} sec, "
+        f"{report_metrics['runtime']['latency_per_question_sec']} sec/question"
+    )
     print(f"{'='*60}\n")
 
     return official_evaluation_results.get('f1', 0.0)
@@ -536,6 +580,15 @@ def build_arg_parser() -> ArgumentParser:
         type=int,
         default=None,
         help="Optional example limit for smoke tests; default runs the full split.",
+    )
+    parser.add_argument(
+        "--baseline_report_metrics",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a baseline *_report_metrics.json. The hard-TTA "
+            "report will include quality gains, runtime overhead, and gain-per-day."
+        ),
     )
 
     # ── TTA-specific args (NEW) ──────────────────────────────────
@@ -938,6 +991,7 @@ if __name__ == '__main__':
             print(f"Retriever: {opt.retrieval_query_model_name_or_path}")
 
             # ── Inject LoRA (Level 2) ──
+            lora_stats = None
             if opt.tta_level in ('l2', 'both'):
                 retriever.query_model = inject_lora(
                     model=retriever.query_model,
@@ -950,6 +1004,11 @@ if __name__ == '__main__':
                 )
                 retriever.query_model.eval()
                 lora_stats = count_lora_parameters(retriever.query_model)
+                lora_stats["trainable"] = trainable_lora_params
+                lora_stats["trainable_pct"] = round(
+                    100.0 * trainable_lora_params / max(lora_stats["total"], 1),
+                    6,
+                )
                 print(
                     f"[TTA] LoRA injected: rank={opt.tta_lora_rank}, "
                     f"alpha={opt.tta_lora_alpha}, "
@@ -994,6 +1053,10 @@ if __name__ == '__main__':
                 cross_encoder,
                 runtime_arguments=runtime_arguments,
                 max_inference_examples=opt.max_inference_examples,
+                lora_stats=lora_stats,
+                baseline_report_metrics=load_report_metrics(
+                    opt.baseline_report_metrics
+                ),
             )
 
         finally:

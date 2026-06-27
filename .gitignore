@@ -79,3 +79,7 @@ train_*/
 tmp/
 temp/
 TouR/
+
+# Local experiment notes and ablation outputs
+docs/
+ablation/
